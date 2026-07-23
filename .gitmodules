@@ -1,0 +1,6 @@
+[submodule "external/BELT-Fusion"]
+	path = external/BELT-Fusion
+	url = https://github.com/ZhiguoZhao/BELT-Fusion.git
+[submodule "external/trackformer"]
+	path = external/trackformer
+	url = https://github.com/timmeinhardt/trackformer.git
