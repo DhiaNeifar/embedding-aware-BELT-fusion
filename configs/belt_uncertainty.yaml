@@ -1,0 +1,32 @@
+# Parent-repository defaults for the frozen-detector uncertainty stage.
+# The CLI currently exposes these values explicitly; this file records the
+# reproducible full-training defaults.
+detector:
+  freeze: true
+  checkpoint_dir: models/pointpillar_late_fusion
+  opencood_config: models/pointpillar_late_fusion/config.yaml
+
+uncertainty_heads:
+  bev_channels: 384
+  hidden_channels: 128
+  anchor_count: 2
+  class_outcomes: 2  # background and vehicle
+  regression_dimensions: 7
+  min_log_variance: -10.0
+  max_log_variance: 10.0
+
+loss:
+  regression_weight: 1.0
+  classification_weight: 1.0
+  kl_weight: 0.001
+  negative_weight: 0.25
+  anneal_epochs: 10
+
+training:
+  epochs: 10
+  batch_size: 2
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  seed: 42
+  validation_batches: 100
+  output_dir: outputs/belt_uncertainty

@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "embedding-aware-belt-fusion"
+version = "0.1.0"
+description = "Plan-0 cross-agent proposal embeddings for BELT-Fusion"
+requires-python = ">=3.9"
+dependencies = [
+  "numpy",
+  "pyyaml",
+  "scipy",
+  "torch",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff"]
+
+[project.scripts]
+train-belt-uncertainty = "embedding_aware_belt_fusion.integration.train_uncertainty:main"
+evaluate-belt-uncertainty = "embedding_aware_belt_fusion.evaluation.uncertainty:main"
+evaluate-belt-fusion = "embedding_aware_belt_fusion.evaluation.belt_fusion:main"
+extract-opencood-proposals = "embedding_aware_belt_fusion.data.extract_proposals:main"
+train-proposal-embedding = "embedding_aware_belt_fusion.embeddings.train:main"
+train-pointpillars-trackformer = "embedding_aware_belt_fusion.embeddings.train_trackformer:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100

@@ -203,6 +203,27 @@ cython_debug/
 # Temporary file for partial code execution
 tempCodeRunnerFile.py
 
+# Research data and generated artifacts
+data/
+datasets/
+checkpoints/
+pointpillar_late_fusion*/
+outputs/*
+!outputs/.gitkeep
+*.pth
+*.pt
+*.ckpt
+*.pkl
+*.pickle
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.parquet
+
+# Local machine configuration (commit *.example.yaml instead)
+configs/local*.yaml
+
 # Ruff stuff:
 .ruff_cache/
 

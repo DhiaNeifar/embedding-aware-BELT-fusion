@@ -1,0 +1,25 @@
+cache:
+  bev_height: 13
+  bev_width: 44
+  minimum_gt_iou: 0.5
+
+model:
+  pointpillars_channels: 384
+  d_model: 256
+  embedding_dim: 128
+  heads: 8
+  encoder_layers: 6
+  decoder_layers: 6
+  feedforward_dim: 2048
+  dropout: 0.1
+  false_track_queries: 2
+
+training:
+  epochs: 30
+  frames_per_batch: 1
+  workers: 4
+  prefetch_factor: 1
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  validation_fraction: 0.2
+  seed: 42

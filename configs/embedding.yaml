@@ -1,0 +1,24 @@
+proposal_extraction:
+  split: train
+  minimum_gt_iou: 0.5
+  shard_frames: 100
+  feature_dim: 384
+  feature_source: pointpillar_pre_head_bev_cell
+  noise_disabled: true
+
+embedding:
+  hidden_dims: [256, 128]
+  embedding_dim: 128
+  dropout: 0.1
+  l2_normalize: true
+  objective: cross_agent_supervised_contrastive
+  temperature: 0.07
+
+training:
+  epochs: 30
+  batch_size_frames: 16
+  workers: 4
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  validation_fraction_by_scenario: 0.2
+  seed: 42

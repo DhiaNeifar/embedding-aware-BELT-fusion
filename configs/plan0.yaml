@@ -1,0 +1,40 @@
+experiment:
+  seed: 42
+
+proposal_extraction:
+  # Recommended pending the detector integration smoke test; see docs/plan0_design.md.
+  feature_source: bev_roi_align
+  feature_level: highest_resolution
+  pooled_size: [3, 3]
+  score_threshold: 0.3
+  gt_iou_threshold: 0.5
+  gt_ignore_iou_below: 0.3
+
+embedding:
+  input_dim: null  # resolved after the chosen feature extractor is verified
+  hidden_dims: [256, 128]
+  output_dim: 128
+  l2_normalize: true
+  loss: supervised_contrastive
+  temperature: 0.07
+
+matching:
+  mode: combined  # original | embedding_only | combined
+  lambda_geometry: 1.0
+  lambda_embedding: 1.0
+  lambda_uncertainty: 0.0
+  normalization: robust_percentile
+  max_cost: null  # calibrate on validation split
+  min_embedding_similarity: null
+  original_distance_threshold_m: 5.0
+
+pose_noise:
+  # Evaluation-time noise; labels remain derived from noise-free physical identity.
+  translation_std_m: 0.0
+  heading_std_deg: 0.0
+
+evaluation:
+  translation_std_m: [0.0, 0.1, 0.2, 0.5, 1.0]
+  heading_std_deg: [0.0, 0.2, 0.5, 1.0, 2.0]
+  ap_iou_thresholds: [0.5, 0.7]
+  embedding_payload_dtypes: [float32, float16]

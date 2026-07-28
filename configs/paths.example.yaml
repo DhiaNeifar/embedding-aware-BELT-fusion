@@ -1,0 +1,6 @@
+# Copy to configs/local.paths.yaml and edit locally. The local file is gitignored.
+opv2v_root: /mnt/external/workspace/public/dataset/opv2v
+belt_fusion_root: external/BELT-Fusion
+trackformer_root: external/trackformer
+proposal_output_root: outputs/proposals
+checkpoint_root: outputs/checkpoints

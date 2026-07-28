@@ -4,3 +4,9 @@
 [submodule "external/trackformer"]
 	path = external/trackformer
 	url = https://github.com/timmeinhardt/trackformer.git
+[submodule "OpenCOOD"]
+	path = external/OpenCOOD
+	url = https://github.com/DerrickXuNu/OpenCOOD.git
+[submodule "external/mmdetection3d"]
+	path = external/mmdetection3d
+	url = https://github.com/open-mmlab/mmdetection3d.git
