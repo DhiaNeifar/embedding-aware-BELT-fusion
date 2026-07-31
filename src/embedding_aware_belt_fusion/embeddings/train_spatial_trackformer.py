@@ -38,6 +38,15 @@ from embedding_aware_belt_fusion.experiments.overfit_spatial_trackformer import 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cache-dir", type=Path, required=True)
+    parser.add_argument(
+        "--validation-cache-dir",
+        type=Path,
+        help=(
+            "Separate held-out cache for validation. This is useful for "
+            "noise fine-tuning: train and validate on the predefined "
+            "scenario split without extracting the validation frames twice."
+        ),
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument(
         "--trackformer-root",
@@ -289,15 +298,53 @@ def main():
     index = load_or_build_scenario_index(
         args.cache_dir, workers=args.index_workers
     )
-    train, validation, train_scenarios, validation_scenarios = _split_records(
-        index,
-        validation_fraction=args.validation_fraction,
-        seed=args.seed,
-    )
+    if args.validation_cache_dir is None:
+        train, validation, train_scenarios, validation_scenarios = _split_records(
+            index,
+            validation_fraction=args.validation_fraction,
+            seed=args.seed,
+        )
+        validation_cache_dir = args.cache_dir
+    else:
+        validation_cache_dir = args.validation_cache_dir
+        train_manifest = json.loads(
+            (args.cache_dir / "manifest.json").read_text()
+        )
+        validation_manifest = json.loads(
+            (validation_cache_dir / "manifest.json").read_text()
+        )
+        if train_manifest.get("feature_dim") != validation_manifest.get(
+            "feature_dim"
+        ):
+            raise ValueError(
+                "Training and validation caches use different feature dimensions"
+            )
+        if train_manifest.get("noise") != validation_manifest.get("noise"):
+            raise ValueError(
+                "Training and validation caches must use identical noise settings"
+            )
+        validation_index = load_or_build_scenario_index(
+            validation_cache_dir, workers=args.index_workers
+        )
+        train, validation = index["frames"], validation_index["frames"]
+        train_scenarios = sorted(
+            {record["scenario_id"] for record in train}
+        )
+        validation_scenarios = sorted(
+            {record["scenario_id"] for record in validation}
+        )
+        overlap = set(train_scenarios) & set(validation_scenarios)
+        if overlap:
+            raise ValueError(
+                "Training and validation caches overlap in scenarios: "
+                f"{sorted(overlap)}"
+            )
     train = _limit_records(train, args.max_train_frames)
     validation = _limit_records(validation, args.max_validation_frames)
     train_data = IndexedCompleteFrameDataset(args.cache_dir, train)
-    validation_data = IndexedCompleteFrameDataset(args.cache_dir, validation)
+    validation_data = IndexedCompleteFrameDataset(
+        validation_cache_dir, validation
+    )
     options = {
         "batch_size": args.batch_size,
         "num_workers": args.workers,
@@ -320,6 +367,7 @@ def main():
         "validation_scenarios": validation_scenarios,
         "train_frames": len(train_data),
         "validation_frames": len(validation_data),
+        "validation_cache_dir": str(Path(validation_cache_dir).resolve()),
     }
     args.output_dir.mkdir(parents=True, exist_ok=True)
     (args.output_dir / "scenario_split.json").write_text(
@@ -379,11 +427,24 @@ def main():
         start_epoch = int(saved["epoch"])
         best = float(saved["metrics"]["validation_embedding_top1"])
     elif args.initialize_from:
-        best = float(
-            initial_checkpoint.get("metrics", {}).get(
-                "validation_embedding_top1", -1.0
-            )
+        # Checkpoints may have been selected on clean validation data.  Their
+        # stored score is not comparable to this run's noisy validation set,
+        # so establish the baseline on the current held-out cache instead.
+        baseline = _run_epoch(
+            model,
+            validation_loader,
+            matcher,
+            criterion,
+            device,
+            args,
+            None,
+            "initial noisy validation",
         )
+        best = float(baseline["embedding_top1"])
+        baseline_record = {
+            "epoch": 0,
+            **{f"validation_{key}": value for key, value in baseline.items()},
+        }
         initialized_best = _checkpoint(
             0,
             model,
@@ -391,7 +452,7 @@ def main():
             scheduler,
             args,
             split,
-            initial_checkpoint.get("metrics", {}),
+            baseline_record,
         )
         initialized_best["initialized_from"] = str(args.initialize_from)
         torch.save(
@@ -400,7 +461,7 @@ def main():
         )
         print(
             f"Starting fresh {args.training_stage!r} optimization from "
-            f"{args.initialize_from}; preserved initialization score="
+            f"{args.initialize_from}; noisy initialization score="
             f"{best:.6f}"
         )
     print(
