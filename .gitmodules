@@ -10,3 +10,7 @@
 [submodule "external/mmdetection3d"]
 	path = external/mmdetection3d
 	url = https://github.com/open-mmlab/mmdetection3d.git
+[submodule "external/OpenCOOD-SWFormer"]
+	path = external/OpenCOOD-SWFormer
+	url = https://github.com/ShrootBuck/OpenCOOD.git
+	branch = feature/full-swformer

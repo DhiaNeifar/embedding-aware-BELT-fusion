@@ -15,8 +15,8 @@
 \setbeamercolor{structure}{fg=accent}
 \setbeamercolor{frametitle}{fg=accent}
 
-\title{Spatial TrackFormer for Cross-Agent Object Association}
-\subtitle{Progress Report: Embedding-Aware Cooperative LiDAR Perception}
+\title{Embedding-Aware Cooperative LiDAR Perception}
+\subtitle{Spatial TrackFormer Association and SWFormer Detector Exploration}
 \author{Dhia}
 \date{July 2026}
 
@@ -57,6 +57,164 @@
 \centering
 \alert{Key correction:} the original MLP read only one BEV feature cell;
 the final model reads all cells covered by the vehicle box.
+\end{frame}
+
+\begin{frame}{SWFormer: Why Use a Sparse-Window Transformer?}
+\begin{columns}[T,onlytextwidth]
+\column{0.48\textwidth}
+\begin{block}{The LiDAR problem}
+\begin{itemize}\setlength{\itemsep}{3pt}
+  \item A driving scene spans a large ground-plane area, but only a small
+  fraction of cells contain LiDAR points.
+  \item A dense BEV CNN still computes over many empty cells; global attention
+  over all cells would be prohibitively expensive.
+\end{itemize}
+\end{block}
+
+\column{0.48\textwidth}
+\begin{block}{SWFormer contribution~\cite{swformer}}
+\begin{itemize}\setlength{\itemsep}{3pt}
+  \item Keep only occupied voxels as sparse tokens.
+  \item Apply self-attention inside small spatial windows, then shift windows
+  so neighbouring regions can exchange information.
+  \item Fuse multiple sparse resolutions and diffuse foreground information
+  before predicting object centers and boxes.
+\end{itemize}
+\end{block}
+\end{columns}
+
+\vspace{3mm}
+\centering
+\alert{High-level goal:} obtain Transformer context without paying for dense
+computation over empty LiDAR space.
+\end{frame}
+
+\begin{frame}{SWFormer Detector Architecture: One CAV, One LiDAR Sweep}
+\centering
+\begin{tikzpicture}[
+  font=\small,
+  box/.style={draw, rounded corners=2pt, align=center, minimum height=10mm,
+    text width=22mm},
+  bluebox/.style={box, fill=RoyalBlue!15},
+  greenbox/.style={box, fill=ForestGreen!15},
+  orangebox/.style={box, fill=BurntOrange!16},
+  arrow/.style={-{Latex[length=2mm]}, thick},
+  node distance=4mm
+]
+\node[bluebox] (points) {Raw LiDAR points\\$(x,y,z,r)$};
+\node[bluebox,right=of points] (vfe) {Dynamic PointNet VFE\\sparse voxel tokens\\$[N,128]$};
+\node[greenbox,right=of vfe] (window) {Sparse-window Transformer\\regular + shifted windows};
+\node[greenbox,right=of window] (pyramid) {Sparse feature pyramid\\multi-scale fusion};
+\node[orangebox,right=of pyramid] (head) {Foreground diffusion\\CenterNet-style head};
+
+\node[orangebox,below=13mm of head] (out) {Per-object output\\box, heading, confidence\\+ sparse proposal tokens};
+
+\draw[arrow] (points) -- (vfe);
+\draw[arrow] (vfe) -- (window);
+\draw[arrow] (window) -- (pyramid);
+\draw[arrow] (pyramid) -- (head);
+\draw[arrow] (head) -- (out);
+\end{tikzpicture}
+
+\vspace{1mm}
+\scriptsize
+\begin{itemize}\setlength{\itemsep}{2pt}
+  \item A \textbf{window} is a local $10\times10$ BEV neighbourhood; attention
+  compares occupied tokens only within that window. Shifted windows connect
+  neighbouring windows on the next block.
+  \item The feature pyramid provides both fine spatial detail and broader
+  scene context. Voxel diffusion supplies nearby context where LiDAR points
+  are sparse around an object.
+  \item Our current OpenCOOD experiment uses one sweep per CAV; it does not
+  yet exploit SWFormer's optional multi-sweep temporal input.
+\end{itemize}
+\end{frame}
+
+\begin{frame}{How SWFormer Learns 3D Detection}
+\small
+For each sparse BEV token, SWFormer predicts foreground, an object-center
+heatmap, box parameters, and heading. The implemented objective is
+\[
+\mathcal{L}_{\mathrm{SW}}=
+200\,\mathcal{L}_{\mathrm{seg}}^{\mathrm{focal}}+
+10\,\mathcal{L}_{\mathrm{center}}^{\mathrm{focal}}+
+\mathcal{L}_{\mathrm{box}}^{\mathrm{Smooth}\text{-}L_1}+
+\mathcal{L}_{\mathrm{heading}}^{\mathrm{CE}+\mathrm{Smooth}\text{-}L_1}+
+\mathcal{L}_{\mathrm{IoU}}^{3\mathrm{D}}.
+\]
+
+\begin{columns}[T,onlytextwidth]
+\column{0.49\textwidth}
+\begin{itemize}\setlength{\itemsep}{4pt}
+  \item $\mathcal{L}_{\mathrm{seg}}$: classify sparse cells as foreground or
+  background; focal weighting handles the large background majority.
+  \item $\mathcal{L}_{\mathrm{center}}$: make each vehicle center a confident
+  local heatmap peak.
+  \item $\mathcal{L}_{\mathrm{box}}$: regress center offsets and $h,w,l$.
+\end{itemize}
+
+\column{0.49\textwidth}
+\begin{itemize}\setlength{\itemsep}{4pt}
+  \item $\mathcal{L}_{\mathrm{heading}}$: classify one of 12 yaw bins and
+  regress the residual within that bin.
+  \item $\mathcal{L}_{\mathrm{IoU}}^{3\mathrm{D}}$: directly rewards overlap
+  between the decoded oriented prediction and its ground-truth box.
+  \item The final confidence score is used to rank detections for the
+  precision--recall curve and AP.
+\end{itemize}
+\end{columns}
+
+\vspace{2mm}
+\centering\footnotesize
+\alert{Important:} lower training loss is useful, but validation AP measures
+the actual detection-and-ranking quality we report.
+\end{frame}
+
+\begin{frame}{Detector Features $\rightarrow$ Shared Embedding Interface}
+\centering
+\begin{tikzpicture}[
+  font=\scriptsize,
+  box/.style={draw, rounded corners=2pt, align=center, minimum height=9mm,
+    text width=23mm},
+  smallbox/.style={box, text width=18mm},
+  bluebox/.style={box, fill=RoyalBlue!15},
+  greenbox/.style={box, fill=ForestGreen!15},
+  orangebox/.style={box, fill=BurntOrange!16},
+  arrow/.style={-{Latex[length=2mm]}, thick},
+  node distance=4mm and 5mm
+]
+\node[bluebox] (lidar) {Each CAV's\\raw LiDAR};
+\node[bluebox,right=of lidar,yshift=8mm] (pp) {PointPillars\\dense BEV map\\$384\times100\times176$};
+\node[greenbox,right=of lidar,yshift=-13mm] (sw) {SWFormer\\sparse proposal tokens\\$[N,128]$ + coordinates};
+\node[orangebox,right=12mm of pp,yshift=-8mm] (detect) {Detection head\\local boxes + confidence};
+\node[orangebox,smallbox,below=11mm of sw] (roi) {Proposal ROI tokens\\inside each box};
+\node[orangebox,smallbox,right=of roi] (ego) {Transform box geometry\\to ego frame};
+\node[greenbox,smallbox,right=of ego] (assoc) {Spatial TrackFormer\\association model};
+\node[greenbox,smallbox,right=of assoc] (embed) {L2-normalized\\128-D embedding};
+
+\draw[arrow] (lidar) |- (pp.west);
+\draw[arrow] (lidar) |- (sw.west);
+\draw[arrow] (pp.east) -| (detect.north west);
+\draw[arrow] (sw.east) -| (detect.south west);
+\draw[arrow] (detect.south) |- (roi.north);
+\draw[arrow] (roi) -- (ego);
+\draw[arrow] (ego) -- (assoc);
+\draw[arrow] (assoc) -- (embed);
+\end{tikzpicture}
+
+\vspace{0mm}
+\scriptsize
+\begin{itemize}\setlength{\itemsep}{1pt}
+  \item \textbf{Shared contract:} whichever detector is used, it supplies a
+  detected box, confidence, and the proposal-aligned feature tokens inside
+  that object region.
+  \item The source and ego boxes are represented in the same ego coordinate
+  frame before association. Spatial TrackFormer then maps object evidence to a
+  128-D vector; similar vectors support cross-agent grouping.
+  \item PointPillars currently supplies the trained embedding cache. SWFormer
+  now exposes its native sparse proposal tokens, enabling the same downstream
+  association interface in a future experiment.
+\end{itemize}
 \end{frame}
 
 \begin{frame}{From LiDAR Points to an Object Embedding}
@@ -219,6 +377,8 @@ quality into better end-to-end fusion recall under noisy geometry.
 \begin{thebibliography}{1}
 \bibitem{trackformer} T.~Meinhardt et al., ``TrackFormer: Multi-Object
 Tracking with Transformers,'' CVPR, 2022.
+\bibitem{swformer} P.~Sun et al., ``SWFormer: Sparse Window Transformer for
+3D Object Detection in Point Clouds,'' ECCV, 2022.
 \end{thebibliography}
 \end{frame}
 
