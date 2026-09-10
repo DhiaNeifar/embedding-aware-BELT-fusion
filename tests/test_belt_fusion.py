@@ -4,8 +4,10 @@ from embedding_aware_belt_fusion.integration.belt_fusion import (
     _decoded_local_variance,
     associate_by_embedding,
     associate_by_geometry,
+    associate_ego_with_propagated_sources_simple,
     evidence_to_mass,
     fuse_detections,
+    fuse_groups_score_weighted,
     fuse_two_masses,
 )
 
@@ -78,3 +80,28 @@ def test_embedding_association_selects_identity_over_nearer_wrong_box():
         for group in groups
     )
     assert paired_centers == [[0.0, 5.1], [0.1, 5.0]]
+
+
+def test_simple_propagated_association_and_score_weighted_fusion():
+    ego = {
+        "boxes": torch.tensor(
+            [[0.0, 0.0, 0.0, 1.5, 1.6, 4.0, 0.0]], dtype=torch.float32
+        ),
+        "scores": torch.tensor([0.8]),
+    }
+    source = {
+        "boxes": torch.tensor(
+            [[2.0, 0.0, 0.0, 1.5, 1.6, 4.0, 0.0]], dtype=torch.float32
+        ),
+        "scores": torch.tensor([0.2]),
+        "ego_embeddings": torch.tensor([[1.0, 0.0]]),
+        "embeddings": torch.tensor([[1.0, 0.0]]),
+    }
+    groups = associate_ego_with_propagated_sources_simple(
+        ego, [source], maximum_distance=5.0, minimum_similarity=0.9
+    )
+    fused = fuse_groups_score_weighted(groups)
+    assert int(fused["member_counts"][0]) == 2
+    # Score weights 0.8 and 0.2 give x=(0*0.8+2*0.2)/(0.8+0.2)=0.4.
+    assert torch.allclose(fused["boxes"][0, 0], torch.tensor(0.4))
+    assert torch.allclose(fused["scores"], torch.tensor([0.8]))

@@ -79,7 +79,10 @@ def _find_pair(dataset, minimum_shared, maximum_frames):
 def _metrics(run, matcher):
     output, target = run["target_output"], run["target"]
     logits, boxes = output["pred_logits"][0], output["pred_boxes"][0]
-    match_ids = target["track_query_match_ids"]
+    match_ids = target.get(
+        "track_query_match_ids",
+        torch.empty(0, dtype=torch.long, device=logits.device),
+    )
     valid = match_ids >= 0
     false = ~valid
     track_count = len(match_ids)

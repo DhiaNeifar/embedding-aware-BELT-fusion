@@ -18,6 +18,7 @@ from embedding_aware_belt_fusion.data.complete_cache import (
 )
 from embedding_aware_belt_fusion.embeddings.spatial_trackformer import (
     SpatialTrackFormer,
+    spatial_target,
 )
 from embedding_aware_belt_fusion.embeddings.spatial_trackformer_loss import (
     SpatialHungarianMatcher,
@@ -91,6 +92,12 @@ def parse_args():
         default="full",
     )
     parser.add_argument(
+        "--association-protocol",
+        choices=("propagated", "independent"),
+        default="propagated",
+        help="Use propagated TrackFormer states or directly comparable local embeddings.",
+    )
+    parser.add_argument(
         "--amp", action=argparse.BooleanOptionalAction, default=True
     )
     parser.add_argument("--seed", type=int, default=42)
@@ -145,15 +152,33 @@ def _configure_training_stage(model, stage):
 
 
 def _pair_record(model, matcher, criterion, source, target, args, training):
-    run = model.forward_pair(
-        source,
-        target,
-        matcher,
-        false_track_queries=args.false_track_queries,
-        false_negative_probability=(
-            args.false_negative_probability if training else 0.0
-        ),
-    )
+    if args.association_protocol == "propagated":
+        run = model.forward_pair(
+            source,
+            target,
+            matcher,
+            false_track_queries=args.false_track_queries,
+            false_negative_probability=(
+                args.false_negative_probability if training else 0.0
+            ),
+        )
+    else:
+        # Neither agent receives the other agent's decoder state.
+        device = next(model.parameters()).device
+        target_target = spatial_target(target, device)
+        target_target["track_query_match_ids"] = torch.empty(
+            0, dtype=torch.long, device=device
+        )
+        target_target["track_queries_false_positive_mask"] = torch.empty(
+            0, dtype=torch.bool, device=device
+        )
+        run = {
+            "source_output": model.forward_agent(source),
+            "source_target": spatial_target(source, device),
+            "target_output": model.forward_agent(target),
+            "target": target_target,
+            "track_ids": [],
+        }
     source_losses = criterion(run["source_output"], run["source_target"])
     target_losses = criterion(run["target_output"], run["target"])
     embedding_loss, embedding_top1, embedding_objects = (
@@ -264,6 +289,7 @@ def _checkpoint(epoch, model, optimizer, scheduler, args, split, metrics):
         "split": split,
         "metrics": metrics,
         "pipeline": "spatial_trackformer_v2_geometry_association",
+        "association_protocol": args.association_protocol,
     }
 
 
@@ -285,6 +311,12 @@ def main():
             checkpoint_path, map_location="cpu", weights_only=False
         )
         architecture = initial_checkpoint["arguments"]
+        if args.resume and initial_checkpoint.get(
+            "association_protocol", "propagated"
+        ) != args.association_protocol:
+            raise ValueError(
+                "--resume must use the association protocol stored in its checkpoint"
+            )
         for name in (
             "embedding_dim",
             "d_model",
@@ -438,7 +470,7 @@ def main():
             device,
             args,
             None,
-            "initial noisy validation",
+            f"initial {args.association_protocol} validation",
         )
         best = float(baseline["embedding_top1"])
         baseline_record = {
@@ -461,7 +493,7 @@ def main():
         )
         print(
             f"Starting fresh {args.training_stage!r} optimization from "
-            f"{args.initialize_from}; noisy initialization score="
+            f"{args.initialize_from}; initial validation score="
             f"{best:.6f}"
         )
     print(

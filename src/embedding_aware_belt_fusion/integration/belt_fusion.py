@@ -433,6 +433,118 @@ def singleton_groups(detection: Mapping[str, Tensor]) -> List[List[Dict[str, Ten
     ]
 
 
+def associate_ego_with_propagated_sources_simple(
+    ego: Mapping[str, Tensor],
+    sources: Iterable[Mapping[str, Tensor]],
+    *,
+    maximum_distance: float = 8.0,
+    minimum_similarity: float = 0.5,
+) -> List[List[Dict[str, Tensor]]]:
+    """Cosine/Hungarian association without BELT uncertainty information.
+
+    This is deliberately a minimal late-fusion baseline.  PQ-STF chooses
+    cross-agent correspondences, while box fusion is handled separately by
+    :func:`fuse_groups_score_weighted`.  Neither covariance precision nor
+    evidential mass appears in this path.
+    """
+    groups = [
+        [
+            {
+                "agent_index": 0,
+                "box": ego["boxes"][index],
+                "score": ego["scores"][index],
+            }
+        ]
+        for index in range(len(ego["boxes"]))
+    ]
+    ego_centers = ego["boxes"][:, :2]
+    for source_index, source in enumerate(sources, start=1):
+        count = len(source["boxes"])
+        if not count:
+            continue
+        members = [
+            {
+                "agent_index": source_index,
+                "box": source["boxes"][index],
+                "score": source["scores"][index],
+            }
+            for index in range(count)
+        ]
+        if not len(ego_centers):
+            groups.extend([[member] for member in members])
+            continue
+        similarity = source["ego_embeddings"] @ source["embeddings"].T
+        distance = torch.cdist(ego_centers, source["boxes"][:, :2])
+        cost = 1.0 - similarity + 0.01 * distance
+        rows, columns = linear_sum_assignment(cost.detach().cpu().numpy())
+        matched = set()
+        for row, column in zip(rows.tolist(), columns.tolist()):
+            if (
+                float(similarity[row, column]) >= minimum_similarity
+                and float(distance[row, column]) <= maximum_distance
+            ):
+                groups[row].append(members[column])
+                matched.add(column)
+        groups.extend(
+            [member]
+            for index, member in enumerate(members)
+            if index not in matched
+        )
+    return groups
+
+
+def simple_singleton_groups(
+    detection: Mapping[str, Tensor],
+) -> List[List[Dict[str, Tensor]]]:
+    """Return one plain score/box group per detection."""
+    return [
+        [
+            {
+                "agent_index": -1,
+                "box": detection["boxes"][index],
+                "score": detection["scores"][index],
+            }
+        ]
+        for index in range(len(detection["boxes"]))
+    ]
+
+
+def fuse_groups_score_weighted(
+    groups: Iterable[List[Dict[str, Tensor]]],
+) -> Dict[str, Tensor]:
+    """Fuse matched boxes by detector-score weighting, without BELT.
+
+    Yaw is averaged on the unit circle; all other box components use a
+    detector-confidence weighted mean.  The final score is the best member
+    score, matching the ranking convention used by the existing evaluator.
+    """
+    groups = list(groups)
+    if not groups:
+        return {
+            "boxes": torch.empty((0, 7)),
+            "scores": torch.empty((0,)),
+            "member_counts": torch.empty((0,), dtype=torch.long),
+        }
+    boxes_out, scores_out, counts_out = [], [], []
+    for group in groups:
+        boxes = torch.stack([member["box"] for member in group])
+        scores = torch.stack([member["score"] for member in group])
+        weights = scores.clamp_min(1e-6)
+        fused = (boxes * weights[:, None]).sum(dim=0) / weights.sum()
+        fused[6] = torch.atan2(
+            (torch.sin(boxes[:, 6]) * weights).sum(),
+            (torch.cos(boxes[:, 6]) * weights).sum(),
+        )
+        boxes_out.append(fused)
+        scores_out.append(scores.max())
+        counts_out.append(boxes.new_tensor(len(group), dtype=torch.long))
+    return {
+        "boxes": torch.stack(boxes_out),
+        "scores": torch.stack(scores_out),
+        "member_counts": torch.stack(counts_out),
+    }
+
+
 def fuse_detections(
     detections: Iterable[Mapping[str, Tensor]],
     *,

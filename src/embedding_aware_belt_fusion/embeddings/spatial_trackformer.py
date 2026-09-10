@@ -140,6 +140,21 @@ class SpatialTrackFormer(nn.Module):
         nn.init.zeros_(self.association_head[-1].weight)
         nn.init.zeros_(self.association_head[-1].bias)
 
+    def association_embeddings(self, states, query_geometry):
+        """Create normalized association vectors from decoder states."""
+        if not self.geometry_association:
+            return F.normalize(self.embedding_head(states), dim=-1)
+        geometry = query_geometry.to(device=states.device, dtype=states.dtype)
+        while geometry.ndim < states.ndim:
+            geometry = geometry.unsqueeze(0)
+        geometry = geometry.expand(*states.shape[:-1], geometry.shape[-1])
+        association_input = torch.cat([states, geometry], dim=-1)
+        return F.normalize(
+            self.embedding_head(states)
+            + self.association_head(association_input),
+            dim=-1,
+        )
+
     def _proposal_queries(self, agent, device):
         """Turn each actual PointPillars proposal into one object query."""
         geometry = normalized_ego_geometry(
@@ -157,8 +172,12 @@ class SpatialTrackFormer(nn.Module):
         return content, positions, references, geometry
 
     def _memory(self, agent, device):
-        tokens = agent["tokens"].to(device)
-        positions = agent["positions"].to(device)
+        # Materialized ROI caches may store appearance tokens as float16 to
+        # reduce disk use.  The projection weights define the computation
+        # dtype when no autocast context is active (e.g., codebook fitting).
+        memory_dtype = next(self.token_projection.parameters()).dtype
+        tokens = agent["tokens"].to(device=device, dtype=memory_dtype)
+        positions = agent["positions"].to(device=device, dtype=memory_dtype)
         valid = ~agent["mask"].to(device)
         if not valid.any():
             raise ValueError("Agent contains no valid proposal ROI cells")
@@ -251,22 +270,7 @@ class SpatialTrackFormer(nn.Module):
         boxes = (
             box_deltas + reference_logits[None, None]
         ).sigmoid()
-        if self.geometry_association:
-            expanded_geometry = query_geometry[None, None].expand(
-                states.shape[0], states.shape[1], -1, -1
-            )
-            association_input = torch.cat(
-                [states, expanded_geometry.to(states.dtype)], dim=-1
-            )
-            embeddings = F.normalize(
-                self.embedding_head(states)
-                + self.association_head(association_input),
-                dim=-1,
-            )
-        else:
-            embeddings = F.normalize(
-                self.embedding_head(states), dim=-1
-            )
+        embeddings = self.association_embeddings(states, query_geometry)
         output = {
             "pred_logits": logits[-1],
             "pred_boxes": boxes[-1],

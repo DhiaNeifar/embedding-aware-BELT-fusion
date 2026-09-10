@@ -140,6 +140,7 @@ def main():
             training.get("hard_negative_margin", 0.2)
         ),
         training_stage=training.get("training_stage", "full"),
+        association_protocol=saved.get("association_protocol", "propagated"),
     )
     matcher = SpatialHungarianMatcher()
     criterion = SpatialTrackFormerCriterion(matcher)

@@ -19,11 +19,20 @@ from embedding_aware_belt_fusion.features import (
 from embedding_aware_belt_fusion.embeddings.spatial_trackformer import (
     SpatialTrackFormer,
 )
+from embedding_aware_belt_fusion.embeddings.geometry import transform_boxes_to_ego
+from embedding_aware_belt_fusion.communication.product_codebook import (
+    load_product_codebook,
+    load_residual_product_codebook,
+)
 from embedding_aware_belt_fusion.integration.belt_fusion import (
+    associate_by_embedding,
     associate_ego_with_propagated_sources,
+    associate_ego_with_propagated_sources_simple,
     fuse_detections,
     fuse_groups,
+    fuse_groups_score_weighted,
     proposal_uncertainty,
+    simple_singleton_groups,
     singleton_groups,
 )
 from embedding_aware_belt_fusion.integration.opencood_uncertainty import (
@@ -56,10 +65,46 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--association-distance", type=float, default=5.0)
     parser.add_argument("--trackformer-checkpoint", type=Path)
     parser.add_argument(
+        "--trackformer-protocol",
+        choices=("propagated", "independent"),
+        default="propagated",
+        help="Association message protocol used by the TrackFormer checkpoint.",
+    )
+    parser.add_argument(
+        "--message-codebook", type=Path,
+        help="Shared product-codebook checkpoint used to quantize source messages.",
+    )
+    parser.add_argument(
+        "--residual-message-codebook",
+        type=Path,
+        help="Progressive residual codebook for 256-D propagated query states.",
+    )
+    parser.add_argument(
+        "--residual-stages",
+        type=int,
+        help="Fixed prefix length of --residual-message-codebook to transmit.",
+    )
+    parser.add_argument(
+        "--adaptive-rate-thresholds",
+        nargs=2,
+        type=float,
+        metavar=("LOW_TO_MEDIUM", "MEDIUM_TO_HIGH"),
+        help="Use 1/2/3 residual stages based on source-local uncertainty rank.",
+    )
+    parser.add_argument(
         "--trackformer-root", type=Path, default=Path("external/trackformer")
     )
     parser.add_argument("--embedding-distance", type=float, default=8.0)
     parser.add_argument("--embedding-min-similarity", type=float, default=0.5)
+    parser.add_argument(
+        "--trackformer-box-fusion",
+        choices=("belt", "score-weighted"),
+        default="belt",
+        help=(
+            "Use BELT uncertainty fusion (belt), or plain detector-score "
+            "weighted box averaging after cosine/Hungarian association."
+        ),
+    )
     parser.add_argument(
         "--track-query-score-threshold", type=float, default=0.5
     )
@@ -159,6 +204,20 @@ def _select_detection(detection, indices):
     }
 
 
+def _simple_detection(proposal, cav_content):
+    """Transform only PointPillars boxes/scores to ego coordinates.
+
+    No uncertainty, covariance, or evidential value is included.  This is the
+    message used by the score-weighted TrackFormer ablation.
+    """
+    return {
+        "boxes": transform_boxes_to_ego(
+            proposal["boxes"], cav_content["transformation_matrix"]
+        ),
+        "scores": proposal["scores"],
+    }
+
+
 def _select_trackformer_agent(agent, indices):
     return {
         "boxes": agent["boxes"][indices],
@@ -212,6 +271,19 @@ def _trackformer_agent(proposal, cav_content, output, hypes):
     }
 
 
+def _has_valid_trackformer_roi(agent):
+    """Whether an agent has at least one BEV cell usable by TrackFormer.
+
+    A detector may produce boxes whose rotated ROI lies completely outside the
+    native BEV map.  Such a frame remains a valid detection/fusion example,
+    but TrackFormer has no feature token from which to form an embedding.
+    """
+    if not len(agent["boxes"]):
+        return True
+    mask = agent["mask"]
+    return bool(mask.numel() and (~mask.bool()).any())
+
+
 def _load_trackformer(args, feature_dim, device):
     if args.trackformer_checkpoint is None:
         return None, None
@@ -223,6 +295,12 @@ def _load_trackformer(args, feature_dim, device):
             "TrackFormer checkpoint must be the geometry-association v2 model"
         )
     training = saved["arguments"]
+    checkpoint_protocol = saved.get("association_protocol", "propagated")
+    if checkpoint_protocol != args.trackformer_protocol:
+        raise ValueError(
+            f"Checkpoint was trained for {checkpoint_protocol!r}; "
+            f"requested {args.trackformer_protocol!r} evaluation"
+        )
     model = SpatialTrackFormer(
         trackformer_root=args.trackformer_root,
         input_dim=feature_dim,
@@ -240,10 +318,134 @@ def _load_trackformer(args, feature_dim, device):
     return model, int(saved["epoch"])
 
 
+def _load_message_codebook(args, trackformer, device):
+    if args.message_codebook is not None and args.residual_message_codebook is not None:
+        raise ValueError("Use only one of --message-codebook and --residual-message-codebook")
+    codebook_path = args.message_codebook or args.residual_message_codebook
+    if codebook_path is None:
+        if args.residual_stages is not None or args.adaptive_rate_thresholds is not None:
+            raise ValueError("Adaptive/residual-rate options require --residual-message-codebook")
+        return None, None
+    if trackformer is None:
+        raise ValueError("A message codebook requires --trackformer-checkpoint")
+    if args.residual_message_codebook is not None:
+        codebook, metadata = load_residual_product_codebook(codebook_path, device)
+        if args.residual_stages is not None and not 1 <= args.residual_stages <= len(codebook.stages):
+            raise ValueError("--residual-stages must select a valid residual-codebook prefix")
+        if args.adaptive_rate_thresholds is not None:
+            low, high = args.adaptive_rate_thresholds
+            if not 0.0 <= low < high <= 1.0:
+                raise ValueError("Adaptive thresholds must satisfy 0 <= low < high <= 1")
+    else:
+        if args.residual_stages is not None or args.adaptive_rate_thresholds is not None:
+            raise ValueError("Residual-rate options require --residual-message-codebook")
+        codebook, metadata = load_product_codebook(codebook_path, device)
+    expected = (
+        "query-state"
+        if args.trackformer_protocol == "propagated"
+        else "embedding"
+    )
+    if metadata["representation"] != expected:
+        raise ValueError(
+            f"{codebook_path} encodes {metadata['representation']!r}; "
+            f"protocol {args.trackformer_protocol!r} requires {expected!r}"
+        )
+    expected_dimension = (
+        trackformer.embedding_head.in_features
+        if expected == "query-state"
+        else trackformer.embedding_head.out_features
+    )
+    if codebook.dimension != expected_dimension:
+        raise ValueError("Codebook dimension does not match TrackFormer message dimension")
+    return codebook, metadata
+
+
+def _rank_unit_interval(values):
+    """Return deterministic within-source ranks in [0, 1]."""
+    if len(values) <= 1:
+        return torch.full_like(values, 0.5)
+    order = values.argsort()
+    ranks = torch.empty_like(values, dtype=torch.float32)
+    ranks[order] = torch.arange(
+        len(values), device=values.device, dtype=torch.float32
+    )
+    return ranks / float(len(values) - 1)
+
+
+def _adaptive_stage_counts(detection, thresholds):
+    """Choose more residual stages for locally more uncertain source objects.
+
+    Classification uncertainty, ego-frame position standard deviation, and
+    heading standard deviation have incompatible physical units.  We rank each
+    quantity within the current source CAV's object messages, then average the
+    three ranks.  This supplies a source-local, unit-free rate decision.
+    """
+    count = len(detection["boxes"])
+    if not count:
+        return torch.empty(0, dtype=torch.long, device=detection["boxes"].device)
+    class_rank = _rank_unit_interval(detection["class_uncertainty"])
+    diagonal = detection["covariances"].diagonal(dim1=-2, dim2=-1)
+    position_std = diagonal[:, :2].mean(dim=-1).clamp_min(0).sqrt()
+    heading_std = diagonal[:, 6].clamp_min(0).sqrt()
+    uncertainty_rank = (
+        class_rank
+        + _rank_unit_interval(position_std)
+        + _rank_unit_interval(heading_std)
+    ) / 3.0
+    low, high = thresholds
+    return (
+        1
+        + (uncertainty_rank >= low).long()
+        + (uncertainty_rank >= high).long()
+    )
+
+
+def _transmit(codebook, vectors, *, normalize=False, stages=None):
+    """Round-trip source messages and return reconstruction, bits, and IDs."""
+    if codebook is None:
+        return vectors, int(len(vectors) * vectors.shape[-1] * 32), 0
+    if hasattr(codebook, "cumulative_bits"):
+        if stages is None:
+            stages = len(codebook.stages)
+        if isinstance(stages, int):
+            restored, codes = codebook.roundtrip(vectors, stages=stages)
+            bits = len(vectors) * codebook.cumulative_bits[stages - 1]
+            index_count = sum(code.numel() for code in codes)
+        else:
+            stages = stages.to(device=vectors.device, dtype=torch.long)
+            if len(stages) != len(vectors):
+                raise ValueError("One adaptive stage count is required per message")
+            restored = torch.empty_like(vectors)
+            bits = index_count = 0
+            for stage_count in stages.unique(sorted=True).tolist():
+                selected = stages == stage_count
+                decoded, codes = codebook.roundtrip(
+                    vectors[selected], stages=int(stage_count)
+                )
+                restored[selected] = decoded
+                bits += int(selected.sum()) * codebook.cumulative_bits[stage_count - 1]
+                index_count += sum(code.numel() for code in codes)
+    else:
+        restored, codes = codebook.roundtrip(vectors)
+        bits = len(vectors) * codebook.bits_per_vector
+        index_count = codes.numel()
+    if normalize:
+        restored = torch.nn.functional.normalize(restored, dim=-1)
+    return restored, bits, int(index_count)
+
+
 def main() -> None:
     args = parse_args()
     if args.device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is unavailable")
+    if (
+        args.trackformer_box_fusion == "score-weighted"
+        and args.trackformer_protocol != "propagated"
+    ):
+        raise ValueError(
+            "--trackformer-box-fusion score-weighted currently supports "
+            "the propagated PQ-STF protocol only"
+        )
     device = torch.device(args.device)
 
     from opencood.data_utils.datasets import build_dataset
@@ -291,17 +493,31 @@ def main() -> None:
     trackformer, trackformer_epoch = _load_trackformer(
         args, int(detector.backbone.num_bev_features), device
     )
+    message_codebook, message_metadata = _load_message_codebook(
+        args, trackformer, device
+    )
 
     naive_statistics = _statistics()
     belt_statistics = _statistics()
     embedding_statistics = _statistics() if trackformer is not None else None
     frame_count = candidate_count = fused_count = matched_groups = 0
     embedding_fused_count = embedding_matched_groups = 0
+    trackformer_roi_fallback_frames = 0
     track_query_count = selected_track_query_count = 0
     track_query_score_sum = 0.0
     track_query_score_min = float("inf")
     track_query_score_max = float("-inf")
-    progress = tqdm(loader, desc="evaluating BELT fusion")
+    message_code_count = 0
+    transmitted_message_count = 0
+    transmitted_message_bits = 0
+    progress = tqdm(
+        loader,
+        desc=(
+            "evaluating cosine association + score-weighted fusion"
+            if args.trackformer_box_fusion == "score-weighted"
+            else "evaluating BELT fusion"
+        ),
+    )
     with torch.no_grad():
         for batch_index, batch in enumerate(progress):
             if args.max_frames is not None and batch_index >= args.max_frames:
@@ -323,6 +539,7 @@ def main() -> None:
 
             detections = []
             detections_by_cav = {}
+            simple_detections_by_cav = {}
             trackformer_agents = {}
             for cav_id, cav_content in batch.items():
                 proposal = decode_local_proposals(
@@ -347,6 +564,9 @@ def main() -> None:
                 )
                 detections.append(detection)
                 detections_by_cav[cav_id] = detection
+                simple_detections_by_cav[cav_id] = _simple_detection(
+                    proposal, cav_content
+                )
             fused = fuse_detections(
                 detections, maximum_distance=args.association_distance
             )
@@ -358,14 +578,90 @@ def main() -> None:
             _evaluate_prediction(
                 belt_boxes, belt_scores, ground_truth, belt_statistics
             )
-            if trackformer is not None:
+            if trackformer is not None and args.trackformer_protocol == "independent":
                 ego_detection = detections_by_cav.get("ego")
+                if ego_detection is None:
+                    raise RuntimeError("Late-fusion batch has no ego agent")
+                # A proposal can fall completely outside the BEV feature map.
+                # It still has a valid detector box, but cannot obtain an
+                # ROI-derived embedding.  Preserve the frame through the
+                # geometry-only BELT result rather than aborting evaluation or
+                # silently discarding its detections.
+                if (
+                    not len(ego_detection["boxes"])
+                    or not all(
+                        _has_valid_trackformer_roi(agent)
+                        for agent in trackformer_agents.values()
+                    )
+                ):
+                    embedded = fused
+                    trackformer_roi_fallback_frames += 1
+                else:
+                    ego_output = trackformer.forward_agent(
+                        trackformer_agents["ego"]
+                    )
+                    ego_detection["embeddings"] = ego_output["embeddings"][0]
+                    independent_detections = [ego_detection]
+                    for cav_id, _ in batch.items():
+                        if cav_id == "ego":
+                            continue
+                        detection = detections_by_cav[cav_id]
+                        source_agent = trackformer_agents[cav_id]
+                        if not len(source_agent["boxes"]):
+                            independent_detections.append(detection)
+                            continue
+                        source_output = trackformer.forward_agent(source_agent)
+                        stage_counts = (
+                            _adaptive_stage_counts(
+                                detection, args.adaptive_rate_thresholds
+                            )
+                            if args.adaptive_rate_thresholds is not None
+                            else args.residual_stages
+                        )
+                        embedding, message_bits, code_count = _transmit(
+                            message_codebook,
+                            source_output["embeddings"][0],
+                            normalize=message_codebook is not None,
+                            stages=stage_counts,
+                        )
+                        transmitted_message_bits += message_bits
+                        message_code_count += code_count
+                        transmitted_message_count += len(embedding)
+                        detection["embeddings"] = embedding
+                        independent_detections.append(detection)
+                    embedded = fuse_detections(
+                        independent_detections,
+                        maximum_distance=args.embedding_distance,
+                        association="embedding",
+                        minimum_similarity=args.embedding_min_similarity,
+                    )
+                embedding_boxes, embedding_scores = _postprocess_fused_boxes(
+                    embedded["boxes"],
+                    embedded["scores"],
+                    opencood_dataset.post_processor,
+                )
+                _evaluate_prediction(
+                    embedding_boxes,
+                    embedding_scores,
+                    ground_truth,
+                    embedding_statistics,
+                )
+                embedding_fused_count += len(embedded["boxes"])
+                embedding_matched_groups += int(
+                    (embedded["member_counts"] > 1).sum()
+                )
+            if trackformer is not None and args.trackformer_protocol == "propagated":
+                if args.trackformer_box_fusion == "score-weighted":
+                    association_detections = simple_detections_by_cav
+                else:
+                    association_detections = detections_by_cav
+                ego_detection = association_detections.get("ego")
                 propagated_sources = []
                 unselected_sources = []
                 for cav_id, _ in batch.items():
                     if cav_id == "ego":
                         continue
-                    detection = detections_by_cav[cav_id]
+                    detection = association_detections[cav_id]
                     source_agent = trackformer_agents[cav_id]
                     ego_agent = trackformer_agents["ego"]
                     if (
@@ -401,14 +697,32 @@ def main() -> None:
                         source_agent, selected
                     )
                     source_output = trackformer.forward_agent(source_agent)
+                    source = _select_detection(detection, selected)
+                    stage_counts = (
+                        _adaptive_stage_counts(
+                            source, args.adaptive_rate_thresholds
+                        )
+                        if args.adaptive_rate_thresholds is not None
+                        else args.residual_stages
+                    )
+                    message_state, message_bits, code_count = _transmit(
+                        message_codebook,
+                        source_output["hs_embed"][0],
+                        stages=stage_counts,
+                    )
+                    transmitted_message_bits += message_bits
+                    message_code_count += code_count
+                    transmitted_message_count += len(message_state)
+                    source_embeddings = trackformer.association_embeddings(
+                        message_state, source_output["query_geometry"]
+                    )
                     target_output = trackformer.forward_agent(
                         ego_agent,
-                        track_states=source_output["hs_embed"][0],
+                        track_states=message_state,
                         track_reference_boxes=source_output["pred_boxes"][0],
                         track_reference_geometry=source_output["query_geometry"],
                     )
-                    source = _select_detection(detection, selected)
-                    source["embeddings"] = source_output["embeddings"][0]
+                    source["embeddings"] = source_embeddings
                     source["ego_embeddings"] = target_output["embeddings"][0][
                         target_output["track_count"] :
                     ]
@@ -416,17 +730,34 @@ def main() -> None:
                 if ego_detection is None:
                     raise RuntimeError("Late-fusion batch has no ego agent")
                 if propagated_sources:
-                    groups = associate_ego_with_propagated_sources(
+                    association = (
+                        associate_ego_with_propagated_sources_simple
+                        if args.trackformer_box_fusion == "score-weighted"
+                        else associate_ego_with_propagated_sources
+                    )
+                    groups = association(
                         ego_detection,
                         propagated_sources,
                         maximum_distance=args.embedding_distance,
                         minimum_similarity=args.embedding_min_similarity,
                     )
                 else:
-                    groups = singleton_groups(ego_detection)
+                    groups = (
+                        simple_singleton_groups(ego_detection)
+                        if args.trackformer_box_fusion == "score-weighted"
+                        else singleton_groups(ego_detection)
+                    )
                 for source in unselected_sources:
-                    groups.extend(singleton_groups(source))
-                embedded = fuse_groups(groups)
+                    groups.extend(
+                        simple_singleton_groups(source)
+                        if args.trackformer_box_fusion == "score-weighted"
+                        else singleton_groups(source)
+                    )
+                embedded = (
+                    fuse_groups_score_weighted(groups)
+                    if args.trackformer_box_fusion == "score-weighted"
+                    else fuse_groups(groups)
+                )
                 embedding_boxes, embedding_scores = _postprocess_fused_boxes(
                     embedded["boxes"],
                     embedded["scores"],
@@ -467,6 +798,65 @@ def main() -> None:
         "embedding_distance_m": args.embedding_distance,
         "embedding_min_similarity": args.embedding_min_similarity,
         "track_query_score_threshold": args.track_query_score_threshold,
+        "trackformer_box_fusion": (
+            args.trackformer_box_fusion if trackformer is not None else None
+        ),
+        "trackformer_protocol": (
+            args.trackformer_protocol if trackformer is not None else None
+        ),
+        "association_message": (
+            {
+                "codebook": (
+                    str((args.message_codebook or args.residual_message_codebook).resolve())
+                    if (args.message_codebook or args.residual_message_codebook) is not None
+                    else None
+                ),
+                "representation": (
+                    message_metadata["representation"]
+                    if message_metadata is not None
+                    else (
+                        "query-state"
+                        if args.trackformer_protocol == "propagated"
+                        else "embedding"
+                    )
+                ),
+                "bits_per_source_object": (
+                    int(message_metadata["bits_per_vector"])
+                    if message_metadata is not None
+                    and "bits_per_vector" in message_metadata
+                    else (
+                        message_metadata["cumulative_bits"][
+                            (args.residual_stages or len(message_codebook.stages)) - 1
+                        ]
+                        if message_metadata is not None
+                        and args.adaptive_rate_thresholds is None
+                        else (
+                            None
+                            if message_metadata is not None
+                            else (
+                                int(trackformer.embedding_head.in_features)
+                                if args.trackformer_protocol == "propagated"
+                                else int(trackformer.embedding_head.out_features)
+                            ) * 32
+                        )
+                    )
+                ),
+                "mean_source_objects_per_frame": (
+                    transmitted_message_count / max(frame_count, 1)
+                ),
+                "mean_association_message_bytes_per_frame": (
+                    transmitted_message_bits / 8 / max(frame_count, 1)
+                ),
+                "mean_association_bits_per_source_object": (
+                    transmitted_message_bits / max(transmitted_message_count, 1)
+                ),
+                "residual_stages": args.residual_stages,
+                "adaptive_rate_thresholds": args.adaptive_rate_thresholds,
+                "total_code_indices": message_code_count,
+            }
+            if trackformer is not None
+            else None
+        ),
         "scenario_subset": (
             {
                 "file": str(args.scenario_split_file.resolve()),
@@ -489,6 +879,9 @@ def main() -> None:
                     args.trackformer_checkpoint.resolve()
                 ),
                 "trackformer_epoch": trackformer_epoch,
+                "trackformer_roi_fallback_frames": (
+                    trackformer_roi_fallback_frames
+                ),
                 "mean_trackformer_fused_boxes_per_frame": (
                     embedding_fused_count / max(frame_count, 1)
                 ),
@@ -506,9 +899,13 @@ def main() -> None:
                 ),
                 "min_trackformer_source_object_score": track_query_score_min,
                 "max_trackformer_source_object_score": track_query_score_max,
-                "belt_trackformer": _ap(
-                    embedding_statistics, args.global_sort_detections
-                ),
+                **{
+                    (
+                        "simple_trackformer"
+                        if args.trackformer_box_fusion == "score-weighted"
+                        else "belt_trackformer"
+                    ): _ap(embedding_statistics, args.global_sort_detections)
+                },
             }
             if embedding_statistics is not None
             else {}
@@ -518,7 +915,12 @@ def main() -> None:
     (args.output_dir / "metrics.json").write_text(
         json.dumps(result, indent=2) + "\n"
     )
-    print("BELT " + json.dumps(result, sort_keys=True))
+    label = (
+        "SIMPLE_TRACKFORMER"
+        if args.trackformer_box_fusion == "score-weighted"
+        else "BELT"
+    )
+    print(label + " " + json.dumps(result, sort_keys=True))
 
 
 if __name__ == "__main__":

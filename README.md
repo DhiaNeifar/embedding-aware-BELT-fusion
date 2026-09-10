@@ -90,6 +90,28 @@ followed by a clear degradation at more severe perturbations.  Association
 Top-1 measures whether the correct cross-agent object has the highest embedding
 similarity; it is not itself a detection AP score.
 
+### Geometry-only ablation
+
+The following ablation removes delay entirely and isolates CAV position and
+heading errors.  The same multiplier is applied to either position, heading,
+or both, depending on the curve being evaluated.
+
+| Alpha | Position-noise std. | Heading-noise std. | Delay |
+|---:|---:|---:|---:|
+| 0 | 0.0 m | 0.0 deg | 0 ms |
+| 1 | 0.2 m | 0.2 deg | 0 ms |
+| 2 | 0.4 m | 0.4 deg | 0 ms |
+| 3 | 0.6 m | 0.6 deg | 0 ms |
+| 4 | 0.8 m | 0.8 deg | 0 ms |
+| 5 | 1.0 m | 1.0 deg | 0 ms |
+
+![Position-only, heading-only, and combined geometry-noise association sweep](outputs/geometry_only_noise_sweep/geometry_only_association_top1.png)
+
+With delay removed, geometry-only perturbations produce only a small Top-1
+change through `alpha = 5`; combined position and heading error is the most
+damaging of the three conditions.  This isolates delay as the primary cause of
+the sharp degradation in the earlier combined noise sweep.
+
 Implementation and cache details are in
 [TrackFormer training](docs/trackformer_training.md).
 
