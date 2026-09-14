@@ -181,6 +181,36 @@ def _group_embedding(group: List[Dict[str, Tensor]]) -> Tensor:
     return torch.nn.functional.normalize(embeddings.mean(dim=0), dim=0)
 
 
+def _constrained_assignment(cost: Tensor, valid: Tensor, *, unmatched_cost: float):
+    """Solve one-to-one assignment with invalid edges and explicit no-match.
+
+    ``linear_sum_assignment`` otherwise forces every available row to compete
+    over *all* columns.  Appending one dummy column per row gives each group or
+    ego proposal an explicit no-match choice. Invalid pairs are impossible
+    before—not after—Hungarian assignment.
+    """
+    if cost.ndim != 2 or valid.shape != cost.shape:
+        raise ValueError("cost and valid must have identical [rows, columns] shape")
+    rows_count, columns_count = cost.shape
+    if not rows_count or not columns_count:
+        return []
+    impossible = torch.finfo(cost.dtype).max / 16
+    constrained = torch.where(valid, cost, torch.full_like(cost, impossible))
+    dummies = torch.full(
+        (rows_count, rows_count),
+        float(unmatched_cost),
+        device=cost.device,
+        dtype=cost.dtype,
+    )
+    augmented = torch.cat([constrained, dummies], dim=1)
+    rows, columns = linear_sum_assignment(augmented.detach().cpu().numpy())
+    return [
+        (row, column)
+        for row, column in zip(rows.tolist(), columns.tolist())
+        if column < columns_count and bool(valid[row, column])
+    ]
+
+
 def associate_by_geometry(
     detections: Iterable[Mapping[str, Tensor]],
     *,
@@ -192,6 +222,7 @@ def associate_by_geometry(
         members = [
             {
                 "agent_index": agent_index,
+                "agent_id": detection.get("agent_id", agent_index),
                 "box": detection["boxes"][index],
                 "score": detection["scores"][index],
                 "evidence": detection["evidence"][index],
@@ -210,12 +241,13 @@ def associate_by_geometry(
         )
         centers = torch.stack([member["box"][:2] for member in members])
         distance = torch.cdist(representatives, centers)
-        rows, columns = linear_sum_assignment(distance.detach().cpu().numpy())
         matched_members = set()
-        for row, column in zip(rows.tolist(), columns.tolist()):
-            if float(distance[row, column]) <= maximum_distance:
-                groups[row].append(members[column])
-                matched_members.add(column)
+        valid = distance <= maximum_distance
+        for row, column in _constrained_assignment(
+            distance, valid, unmatched_cost=maximum_distance + 1e-3
+        ):
+            groups[row].append(members[column])
+            matched_members.add(column)
         groups.extend(
             [member]
             for index, member in enumerate(members)
@@ -240,6 +272,7 @@ def associate_by_embedding(
         members = [
             {
                 "agent_index": agent_index,
+                "agent_id": detection.get("agent_id", agent_index),
                 "box": detection["boxes"][index],
                 "score": detection["scores"][index],
                 "evidence": detection["evidence"][index],
@@ -267,15 +300,105 @@ def associate_by_embedding(
         # The tiny distance term resolves equal-appearance assignments without
         # returning to a geometry-only matcher.
         cost = 1.0 - similarity + 0.01 * distance
-        rows, columns = linear_sum_assignment(cost.detach().cpu().numpy())
+        valid = (
+            (similarity >= minimum_similarity)
+            & (distance <= maximum_distance)
+        )
         matched_members = set()
-        for row, column in zip(rows.tolist(), columns.tolist()):
-            if (
-                float(similarity[row, column]) >= minimum_similarity
-                and float(distance[row, column]) <= maximum_distance
-            ):
-                groups[row].append(members[column])
-                matched_members.add(column)
+        for row, column in _constrained_assignment(
+            cost,
+            valid,
+            unmatched_cost=(
+                1.0 - minimum_similarity + 0.01 * maximum_distance + 1e-3
+            ),
+        ):
+            groups[row].append(members[column])
+            matched_members.add(column)
+        groups.extend(
+            [member]
+            for index, member in enumerate(members)
+            if index not in matched_members
+        )
+    return groups
+
+
+def associate_by_symmetric_pair_head(
+    detections: Iterable[Mapping[str, Tensor]],
+    pair_head,
+    *,
+    maximum_distance: float = 8.0,
+    minimum_probability: float = 0.9,
+    temperature: float = 0.07,
+) -> List[List[Dict[str, Tensor]]]:
+    """Group all agents with a learned, symmetric PQ query-state scorer.
+
+    Each detection supplies a 256-D ``query_states`` tensor and 9-D
+    ``query_geometry`` tensor.  For a new agent, a candidate proposal is
+    compared with every member already in each group; the group's strongest
+    compatible member supplies its score. Hungarian assignment preserves one
+    proposal per agent per group, while an independently calibrated sigmoid
+    probability and explicit dummy assignments allow a valid no-match outcome.
+    """
+    groups: List[List[Dict[str, Tensor]]] = []
+    for agent_index, detection in enumerate(detections):
+        members = [
+            {
+                "agent_index": agent_index,
+                "agent_id": detection.get("agent_id", agent_index),
+                "box": detection["boxes"][index],
+                "score": detection["scores"][index],
+                "evidence": detection["evidence"][index],
+                "class_uncertainty": detection["class_uncertainty"][index],
+                "covariance": detection["covariances"][index],
+                "query_state": detection["query_states"][index],
+                "query_geometry": detection["query_geometry"][index],
+            }
+            for index in range(len(detection["boxes"]))
+        ]
+        if not groups:
+            groups = [[member] for member in members]
+            continue
+        if not members:
+            continue
+
+        representatives = torch.stack(
+            [_group_representative(group) for group in groups]
+        )
+        centers = torch.stack([member["box"][:2] for member in members])
+        distance = torch.cdist(representatives, centers)
+        member_states = torch.stack([member["query_state"] for member in members])
+        member_geometry = torch.stack(
+            [member["query_geometry"] for member in members]
+        )
+        # A group may already contain ego plus one or more source CAVs.  The
+        # maximum is the natural "any trusted member agrees" group score.
+        compatibility = torch.stack(
+            [
+                pair_head(
+                    torch.stack([entry["query_state"] for entry in group]),
+                    torch.stack([entry["query_geometry"] for entry in group]),
+                    member_states,
+                    member_geometry,
+                ).amax(dim=0)
+                for group in groups
+            ]
+        )
+        # This is an independent same-object probability, not a softmax over
+        # existing groups.  A proposal may correctly match no group at all.
+        probability = torch.sigmoid(compatibility)
+        cost = -probability + 0.01 * distance
+        valid = (
+            (probability >= minimum_probability)
+            & (distance <= maximum_distance)
+        )
+        matched_members = set()
+        for row, column in _constrained_assignment(
+            cost,
+            valid,
+            unmatched_cost=-minimum_probability + 0.01 * maximum_distance + 1e-3,
+        ):
+            groups[row].append(members[column])
+            matched_members.add(column)
         groups.extend(
             [member]
             for index, member in enumerate(members)
@@ -371,6 +494,7 @@ def associate_ego_with_propagated_sources(
                 "evidence": ego["evidence"][index],
                 "class_uncertainty": ego["class_uncertainty"][index],
                 "covariance": ego["covariances"][index],
+                "agent_id": ego.get("agent_id", "ego"),
             }
         ]
         for index in range(len(ego["boxes"]))
@@ -388,6 +512,7 @@ def associate_ego_with_propagated_sources(
                 "evidence": source["evidence"][index],
                 "class_uncertainty": source["class_uncertainty"][index],
                 "covariance": source["covariances"][index],
+                "agent_id": source.get("agent_id", source_index),
             }
             for index in range(count)
         ]
@@ -399,15 +524,20 @@ def associate_ego_with_propagated_sources(
         similarity = target_embeddings @ source_embeddings.T
         distance = torch.cdist(ego_centers, source["boxes"][:, :2])
         cost = 1.0 - similarity + 0.01 * distance
-        rows, columns = linear_sum_assignment(cost.detach().cpu().numpy())
+        valid = (
+            (similarity >= minimum_similarity)
+            & (distance <= maximum_distance)
+        )
         matched = set()
-        for row, column in zip(rows.tolist(), columns.tolist()):
-            if (
-                float(similarity[row, column]) >= minimum_similarity
-                and float(distance[row, column]) <= maximum_distance
-            ):
-                groups[row].append(members[column])
-                matched.add(column)
+        for row, column in _constrained_assignment(
+            cost,
+            valid,
+            unmatched_cost=(
+                1.0 - minimum_similarity + 0.01 * maximum_distance + 1e-3
+            ),
+        ):
+            groups[row].append(members[column])
+            matched.add(column)
         groups.extend(
             [member]
             for index, member in enumerate(members)
@@ -453,6 +583,7 @@ def associate_ego_with_propagated_sources_simple(
                 "agent_index": 0,
                 "box": ego["boxes"][index],
                 "score": ego["scores"][index],
+                "agent_id": ego.get("agent_id", "ego"),
             }
         ]
         for index in range(len(ego["boxes"]))
@@ -467,6 +598,7 @@ def associate_ego_with_propagated_sources_simple(
                 "agent_index": source_index,
                 "box": source["boxes"][index],
                 "score": source["scores"][index],
+                "agent_id": source.get("agent_id", source_index),
             }
             for index in range(count)
         ]
@@ -476,15 +608,20 @@ def associate_ego_with_propagated_sources_simple(
         similarity = source["ego_embeddings"] @ source["embeddings"].T
         distance = torch.cdist(ego_centers, source["boxes"][:, :2])
         cost = 1.0 - similarity + 0.01 * distance
-        rows, columns = linear_sum_assignment(cost.detach().cpu().numpy())
+        valid = (
+            (similarity >= minimum_similarity)
+            & (distance <= maximum_distance)
+        )
         matched = set()
-        for row, column in zip(rows.tolist(), columns.tolist()):
-            if (
-                float(similarity[row, column]) >= minimum_similarity
-                and float(distance[row, column]) <= maximum_distance
-            ):
-                groups[row].append(members[column])
-                matched.add(column)
+        for row, column in _constrained_assignment(
+            cost,
+            valid,
+            unmatched_cost=(
+                1.0 - minimum_similarity + 0.01 * maximum_distance + 1e-3
+            ),
+        ):
+            groups[row].append(members[column])
+            matched.add(column)
         groups.extend(
             [member]
             for index, member in enumerate(members)
@@ -537,6 +674,36 @@ def fuse_groups_score_weighted(
         )
         boxes_out.append(fused)
         scores_out.append(scores.max())
+        counts_out.append(boxes.new_tensor(len(group), dtype=torch.long))
+    return {
+        "boxes": torch.stack(boxes_out),
+        "scores": torch.stack(scores_out),
+        "member_counts": torch.stack(counts_out),
+    }
+
+
+def fuse_groups_max_score(
+    groups: Iterable[List[Dict[str, Tensor]]],
+) -> Dict[str, Tensor]:
+    """Keep the highest-confidence member of every associated group.
+
+    This is a non-averaging fusion control: perfect association removes
+    duplicates but never perturbs a detector's geometry.
+    """
+    groups = list(groups)
+    if not groups:
+        return {
+            "boxes": torch.empty((0, 7)),
+            "scores": torch.empty((0,)),
+            "member_counts": torch.empty((0,), dtype=torch.long),
+        }
+    boxes_out, scores_out, counts_out = [], [], []
+    for group in groups:
+        boxes = torch.stack([member["box"] for member in group])
+        scores = torch.stack([member["score"] for member in group])
+        winner = scores.argmax()
+        boxes_out.append(boxes[winner])
+        scores_out.append(scores[winner])
         counts_out.append(boxes.new_tensor(len(group), dtype=torch.long))
     return {
         "boxes": torch.stack(boxes_out),
