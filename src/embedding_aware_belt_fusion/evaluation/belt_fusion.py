@@ -52,6 +52,19 @@ from embedding_aware_belt_fusion.integration.opencood_uncertainty import (
 from embedding_aware_belt_fusion.integration.train_uncertainty import (
     _load_detector_checkpoint,
 )
+from embedding_aware_belt_fusion.evaluation.frame_cache import (
+    EvaluationFrameCache,
+    build_provenance as build_frame_cache_provenance,
+    to_device as cached_to_device,
+)
+from embedding_aware_belt_fusion.evaluation.component_diagnostics import (
+    empty_counts as empty_component_counts,
+    group_counts,
+    merge_counts as merge_component_counts,
+    pair_head_counts,
+    summarize_counts as summarize_component_counts,
+    summarize_group_counts,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -68,11 +81,59 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--max-frames", type=int)
+    parser.add_argument(
+        "--frame-cache-dir",
+        type=Path,
+        help=(
+            "Reusable detector/proposal/ROI cache. It is independent of the "
+            "PQ-STF checkpoint, pair head, RANSAC settings, fusion rule, and "
+            "message codebook."
+        ),
+    )
+    parser.add_argument(
+        "--frame-cache-mode",
+        choices=("off", "read-write", "read-only", "refresh"),
+        default="off",
+        help=(
+            "read-write builds missing artifacts; read-only replays a complete "
+            "compatible cache without loading LiDAR frames or running PointPillars; "
+            "refresh rebuilds it."
+        ),
+    )
     parser.add_argument("--hidden-channels", type=int, default=128)
     parser.add_argument("--position-noise-std", type=float, default=0.0)
     parser.add_argument("--heading-noise-std-deg", type=float, default=0.0)
     parser.add_argument("--time-delay-ms", type=int, default=0)
     parser.add_argument("--noise-seed", type=int, default=20)
+    parser.add_argument(
+        "--noise-mode",
+        choices=("shared", "independent"),
+        default="shared",
+        help=(
+            "shared: one (dx, dy, dyaw) draw per (position_std, heading_std, "
+            "seed), reused identically for every agent and frame in the run "
+            "(current default OpenCOOD behavior, formalized). independent: a "
+            "fresh, independently-seeded draw per (scenario, frame, agent), "
+            "deterministic given --noise-seed."
+        ),
+    )
+    parser.add_argument(
+        "--covariance-noise-variant",
+        choices=("oracle", "fixed-spec"),
+        default="fixed-spec",
+        help=(
+            "oracle: BELT's uncertainty covariance is handed the exact "
+            "injected --position-noise-std/--heading-noise-std-deg at every "
+            "sweep point (oracle knowledge of the ground-truth noise, kept "
+            "for reference only). fixed-spec (default): covariance instead "
+            "uses a single assumed spec set once via "
+            "--assumed-position-noise-std/--assumed-heading-noise-std-deg, "
+            "not refreshed per sweep severity -- fairer against AlignFormer, "
+            "which gets no such oracle input."
+        ),
+    )
+    parser.add_argument("--assumed-position-noise-std", type=float, default=0.2)
+    parser.add_argument("--assumed-heading-noise-std-deg", type=float, default=2.0)
     parser.add_argument("--association-distance", type=float, default=5.0)
     parser.add_argument("--trackformer-checkpoint", type=Path)
     parser.add_argument(
@@ -130,6 +191,16 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=10.0,
         help="Permissive geometric gate used only to obtain RANSAC seed matches.",
+    )
+    parser.add_argument(
+        "--ransac-pair-min-probability",
+        type=float,
+        default=None,
+        help=(
+            "Minimum symmetric pair-head probability used only for RANSAC "
+            "seed correspondences. Defaults to --pair-head-min-probability, "
+            "so final grouping and RANSAC seeds retain the historical shared gate."
+        ),
     )
     parser.add_argument(
         "--ransac-inlier-threshold",
@@ -303,6 +374,78 @@ def _oracle_object_ids(proposal, cav_content, postprocessor):
     return assignment["gt_ids"]
 
 
+def _ego_ground_truth_reference(cav_content):
+    """Return the AP-scope ego ground-truth boxes and physical IDs per frame."""
+    mask = cav_content["object_bbx_mask"][0] > 0
+    object_ids = list(cav_content["object_ids"])
+    valid = mask.nonzero().flatten().tolist()
+    return {
+        "boxes": cav_content["object_bbx_center"][0][mask],
+        "object_ids": [str(object_ids[index]) for index in valid],
+    }
+
+
+def _coverage_categories(detections_by_cav, ego_ground_truth, final_corners, postprocessor):
+    """Diagnose which GT objects can be contributed by source CAVs.
+
+    Counts are per frame-instance, not unique tracks across an entire scenario.
+    A detector proposal is considered to see a GT object when its local
+    proposal-to-GT assignment has IoU >= 0.5.
+    """
+    ground_truth_ids = set(ego_ground_truth["object_ids"])
+    ego_detected = {
+        object_id
+        for object_id in detections_by_cav["ego"]["oracle_object_ids"]
+        if object_id is not None and object_id in ground_truth_ids
+    }
+    source_detected = set()
+    for cav_id, detection in detections_by_cav.items():
+        if cav_id == "ego":
+            continue
+        source_detected.update(
+            object_id
+            for object_id in detection["oracle_object_ids"]
+            if object_id is not None and object_id in ground_truth_ids
+        )
+    categories = {
+        "ego_detected": ego_detected,
+        "source_only_detectable": source_detected - ego_detected,
+        "undetected_by_everyone": ground_truth_ids - ego_detected - source_detected,
+    }
+    recovered = set()
+    if final_corners is not None and len(final_corners):
+        assignment = assign_proposals_to_ground_truth(
+            final_corners,
+            ego_ground_truth["boxes"],
+            ego_ground_truth["object_ids"],
+            order=postprocessor.params["order"],
+            minimum_iou=0.5,
+        )
+        recovered = {
+            object_id for object_id in assignment["gt_ids"] if object_id is not None
+        }
+    return {
+        name: {"total": len(ids), "recovered": len(ids & recovered)}
+        for name, ids in categories.items()
+    }
+
+
+def _merge_coverage(total, update):
+    for category, values in update.items():
+        for key, value in values.items():
+            total[category][key] += value
+
+
+def _summarize_coverage(counts):
+    return {
+        category: {
+            **values,
+            "recall": values["recovered"] / max(values["total"], 1),
+        }
+        for category, values in counts.items()
+    }
+
+
 def _oracle_prediction_correspondences(detections_by_cav):
     """Use physical IDs only to expose trusted predicted-box correspondences."""
     ego = detections_by_cav["ego"]
@@ -388,6 +531,7 @@ def _set_noise(hypes, args):
             ),
             "xyz_std": args.position_noise_std,
             "ryp_std": args.heading_noise_std_deg,
+            "noise_mode": args.noise_mode,
         }
     )
 
@@ -646,6 +790,22 @@ def _adaptive_stage_counts(detection, thresholds):
     )
 
 
+def _message_overhead_bits(detection, query_geometry=None):
+    """Bits needed to deliver a source's raw box geometry and detector score
+    alongside its query-state message, plus TrackFormer query geometry when
+    the receiving side needs it for association/RANSAC. ``_transmit`` only
+    meters the query-state vector itself; every other field a real receiver
+    needs to fuse or associate the message must be counted here too."""
+    count = len(detection["boxes"])
+    if not count:
+        return 0
+    bits = count * detection["boxes"].shape[-1] * 32  # raw box geometry
+    bits += count * 32  # detector confidence score
+    if query_geometry is not None:
+        bits += query_geometry.numel() * 32
+    return bits
+
+
 def _transmit(codebook, vectors, *, normalize=False, stages=None):
     """Round-trip source messages and return reconstruction, bits, and IDs."""
     if codebook is None:
@@ -682,6 +842,8 @@ def _transmit(codebook, vectors, *, normalize=False, stages=None):
 
 def main() -> None:
     args = parse_args()
+    if args.frame_cache_mode != "off" and args.frame_cache_dir is None:
+        raise ValueError("--frame-cache-mode requires --frame-cache-dir")
     if args.device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is unavailable")
     if (
@@ -751,6 +913,11 @@ def main() -> None:
             "--ransac-min-relative-improvement must lie in [0, 1]"
         )
     if (
+        args.ransac_pair_min_probability is not None
+        and not 0.0 <= args.ransac_pair_min_probability <= 1.0
+    ):
+        raise ValueError("--ransac-pair-min-probability must lie in [0, 1]")
+    if (
         args.message_content_ablation != "none"
         and args.trackformer_protocol != "propagated"
     ):
@@ -781,15 +948,6 @@ def main() -> None:
             if _scenario_id(opencood_dataset, index) in scenario_subset
         ]
         dataset = Subset(dataset, frame_indices)
-    loader = DataLoader(
-        dataset,
-        batch_size=1,
-        shuffle=False,
-        num_workers=args.workers,
-        collate_fn=opencood_dataset.collate_batch_test,
-        pin_memory=args.device == "cuda",
-        persistent_workers=args.workers > 0,
-    )
     detector = create_model(hypes)
     detector_checkpoint = _load_detector_checkpoint(args.detector_dir, detector)
     model = FrozenPointPillarWithUncertainty(
@@ -810,6 +968,47 @@ def main() -> None:
     message_codebook, message_metadata = _load_message_codebook(
         args, trackformer, device
     )
+    expected_frames = min(
+        len(dataset), args.max_frames if args.max_frames is not None else len(dataset)
+    )
+    cache_subset = (
+        {
+            "role": args.scenario_role,
+            "scenarios": sorted(scenario_subset),
+        }
+        if scenario_subset is not None
+        else None
+    )
+    frame_cache = EvaluationFrameCache(
+        args.frame_cache_dir,
+        mode=args.frame_cache_mode,
+        provenance=build_frame_cache_provenance(
+            opencood_config=args.opencood_config,
+            detector_checkpoint=detector_checkpoint,
+            uncertainty_checkpoint=args.uncertainty_checkpoint,
+            data_root=args.data_root,
+            split=args.split,
+            noise={
+                "position_std_m": args.position_noise_std,
+                "heading_std_deg": args.heading_noise_std_deg,
+                "time_delay_ms": args.time_delay_ms,
+                "seed": args.noise_seed,
+            },
+            scenario_subset=cache_subset,
+        ),
+        expected_frames=expected_frames,
+    )
+    loader = None
+    if not frame_cache.replay:
+        loader = DataLoader(
+            dataset,
+            batch_size=1,
+            shuffle=False,
+            num_workers=args.workers,
+            collate_fn=opencood_dataset.collate_batch_test,
+            pin_memory=args.device == "cuda",
+            persistent_workers=args.workers > 0,
+        )
 
     naive_statistics = _statistics()
     ego_only_statistics = _statistics()
@@ -844,8 +1043,25 @@ def main() -> None:
     ransac_source_corrected = ransac_source_rejected = ransac_inliers = 0
     ransac_inlier_residual_sum = 0.0
     ransac_relative_improvement_sum = 0.0
+    pair_head_component_counts = empty_component_counts()
+    ransac_seed_group_counts = empty_component_counts()
+    ransac_pair_min_probability = (
+        args.pair_head_min_probability
+        if args.ransac_pair_min_probability is None
+        else args.ransac_pair_min_probability
+    )
+    final_group_counts = empty_component_counts()
+    coverage_counts = {
+        name: {"total": 0, "recovered": 0}
+        for name in (
+            "ego_detected",
+            "source_only_detectable",
+            "undetected_by_everyone",
+        )
+    }
     progress = tqdm(
-        loader,
+        range(expected_frames) if frame_cache.replay else loader,
+        total=expected_frames,
         desc=(
             "evaluating cosine association + plain box fusion"
             if args.trackformer_box_fusion in {"score-weighted", "max-score"}
@@ -853,64 +1069,97 @@ def main() -> None:
         ),
     )
     with torch.no_grad():
-        for batch_index, batch in enumerate(progress):
+        for batch_index, cached_index_or_batch in enumerate(progress):
             if args.max_frames is not None and batch_index >= args.max_frames:
                 break
-            batch = to_device(batch, device)
-            outputs = OrderedDict(
-                (cav_id, model(cav_content))
-                for cav_id, cav_content in batch.items()
-            )
-            naive_boxes, naive_scores, ground_truth = opencood_dataset.post_process(
-                batch, outputs
-            )
+            if frame_cache.replay:
+                artifact = cached_to_device(frame_cache.load(batch_index), device)
+                naive_boxes = artifact["naive_boxes"]
+                naive_scores = artifact["naive_scores"]
+                ground_truth = artifact["ground_truth"]
+                detections_by_cav = artifact["detections_by_cav"]
+                simple_detections_by_cav = artifact["simple_detections_by_cav"]
+                trackformer_agents = artifact["trackformer_agents"]
+                cav_order = artifact["cav_order"]
+                ego_ground_truth = artifact["ego_ground_truth"]
+                detections = [detections_by_cav[cav_id] for cav_id in cav_order]
+            else:
+                batch = to_device(cached_index_or_batch, device)
+                outputs = OrderedDict(
+                    (cav_id, model(cav_content))
+                    for cav_id, cav_content in batch.items()
+                )
+                naive_boxes, naive_scores, ground_truth = opencood_dataset.post_process(
+                    batch, outputs
+                )
+
+                detections = []
+                detections_by_cav = {}
+                simple_detections_by_cav = {}
+                trackformer_agents = {}
+                cav_order = list(batch)
+                ego_ground_truth = _ego_ground_truth_reference(batch["ego"])
+                for cav_id, cav_content in batch.items():
+                    proposal = decode_local_proposals(
+                        outputs[cav_id], cav_content, opencood_dataset.post_processor
+                    )
+                    # Cache ROI tokens regardless of whether this particular
+                    # run enables PQ-STF.  Future association experiments can
+                    # then reuse the detector-side artifact without rerunning
+                    # PointPillars or reading the LiDAR frames again.
+                    trackformer_agents[cav_id] = _trackformer_agent(
+                        proposal, cav_content, outputs[cav_id], hypes
+                    )
+                    if args.covariance_noise_variant == "oracle":
+                        covariance_position_std = args.position_noise_std
+                        covariance_heading_std_deg = args.heading_noise_std_deg
+                    else:
+                        covariance_position_std = args.assumed_position_noise_std
+                        covariance_heading_std_deg = args.assumed_heading_noise_std_deg
+                    detection = proposal_uncertainty(
+                        outputs[cav_id],
+                        proposal,
+                        cav_content,
+                        position_noise_std=(
+                            0.0 if cav_id == "ego" else covariance_position_std
+                        ),
+                        heading_noise_std_deg=(
+                            0.0
+                            if cav_id == "ego"
+                            else covariance_heading_std_deg
+                        ),
+                    )
+                    oracle_ids = _oracle_object_ids(
+                        proposal, cav_content, opencood_dataset.post_processor
+                    )
+                    detection["agent_id"] = cav_id
+                    detection["oracle_object_ids"] = oracle_ids
+                    detections.append(detection)
+                    detections_by_cav[cav_id] = detection
+                    simple_detections_by_cav[cav_id] = _simple_detection(
+                        proposal, cav_content
+                    )
+                    simple_detections_by_cav[cav_id]["agent_id"] = cav_id
+                    simple_detections_by_cav[cav_id]["oracle_object_ids"] = oracle_ids
+                frame_cache.store(
+                    batch_index,
+                    {
+                        "naive_boxes": naive_boxes,
+                        "naive_scores": naive_scores,
+                        "ground_truth": ground_truth,
+                        "detections_by_cav": detections_by_cav,
+                        "simple_detections_by_cav": simple_detections_by_cav,
+                        "trackformer_agents": trackformer_agents,
+                        "cav_order": cav_order,
+                        "ego_ground_truth": ego_ground_truth,
+                    },
+                )
             _evaluate_prediction(
                 naive_boxes,
                 naive_scores,
                 ground_truth,
                 naive_statistics,
             )
-
-            detections = []
-            detections_by_cav = {}
-            simple_detections_by_cav = {}
-            trackformer_agents = {}
-            for cav_id, cav_content in batch.items():
-                proposal = decode_local_proposals(
-                    outputs[cav_id], cav_content, opencood_dataset.post_processor
-                )
-                if trackformer is not None:
-                    trackformer_agents[cav_id] = _trackformer_agent(
-                        proposal, cav_content, outputs[cav_id], hypes
-                    )
-                detection = proposal_uncertainty(
-                    outputs[cav_id],
-                    proposal,
-                    cav_content,
-                    position_noise_std=(
-                        0.0 if cav_id == "ego" else args.position_noise_std
-                    ),
-                    heading_noise_std_deg=(
-                        0.0
-                        if cav_id == "ego"
-                        else args.heading_noise_std_deg
-                    ),
-                )
-                detection["agent_id"] = cav_id
-                detections.append(detection)
-                detections_by_cav[cav_id] = detection
-                simple_detections_by_cav[cav_id] = _simple_detection(
-                    proposal, cav_content
-                )
-                simple_detections_by_cav[cav_id]["agent_id"] = cav_id
-                if args.oracle_grouping:
-                    simple_detections_by_cav[cav_id]["oracle_object_ids"] = (
-                        _oracle_object_ids(
-                            proposal,
-                            cav_content,
-                            opencood_dataset.post_processor,
-                        )
-                    )
             ego_simple_boxes, ego_simple_scores = _postprocess_fused_boxes(
                 simple_detections_by_cav["ego"]["boxes"],
                 simple_detections_by_cav["ego"]["scores"],
@@ -1059,7 +1308,7 @@ def main() -> None:
                     )
                     ego_detection["embeddings"] = ego_output["embeddings"][0]
                     independent_detections = [ego_detection]
-                    for cav_id, _ in batch.items():
+                    for cav_id in cav_order:
                         if cav_id == "ego":
                             continue
                         detection = detections_by_cav[cav_id]
@@ -1082,6 +1331,7 @@ def main() -> None:
                             stages=stage_counts,
                         )
                         transmitted_message_bits += message_bits
+                        transmitted_message_bits += _message_overhead_bits(detection)
                         message_code_count += code_count
                         transmitted_message_count += len(embedding)
                         detection["embeddings"] = embedding
@@ -1118,7 +1368,7 @@ def main() -> None:
                     fallback_detections = []
                     embedding_dim = int(trackformer.embedding_head.out_features)
                     state_dim = int(trackformer.embedding_head.in_features)
-                    for cav_id, _ in batch.items():
+                    for cav_id in cav_order:
                         detection = detections_by_cav[cav_id]
                         agent = trackformer_agents[cav_id]
                         if not len(agent["boxes"]):
@@ -1149,6 +1399,9 @@ def main() -> None:
                                 transmitted_message_bits += (
                                     len(detection["boxes"]) * embedding_dim * 32
                                 )
+                                transmitted_message_bits += _message_overhead_bits(
+                                    detection
+                                )
                         else:
                             states = local_output["hs_embed"][0]
                             if cav_id != "ego":
@@ -1170,6 +1423,9 @@ def main() -> None:
                                     states, args.message_content_ablation
                                 )
                                 transmitted_message_bits += message_bits
+                                transmitted_message_bits += _message_overhead_bits(
+                                    detection, local_output["query_geometry"]
+                                )
                                 message_code_count += code_count
                                 transmitted_message_count += len(states)
                             detection["query_states"] = states
@@ -1183,6 +1439,15 @@ def main() -> None:
                                 minimum_similarity=args.embedding_min_similarity,
                             )
                         else:
+                            merge_component_counts(
+                                pair_head_component_counts,
+                                pair_head_counts(
+                                    direct_detections,
+                                    pair_head,
+                                    maximum_distance=args.embedding_distance,
+                                    minimum_probability=args.pair_head_min_probability,
+                                ),
+                            )
                             groups = associate_by_symmetric_pair_head(
                                 direct_detections,
                                 pair_head,
@@ -1204,8 +1469,11 @@ def main() -> None:
                             direct_detections,
                             pair_head,
                             maximum_distance=args.ransac_seed_distance,
-                            minimum_probability=args.pair_head_min_probability,
+                            minimum_probability=ransac_pair_min_probability,
                         ) if direct_detections else []
+                        merge_component_counts(
+                            ransac_seed_group_counts, group_counts(seed_groups)
+                        )
                         corrections = {}
                         for source_id, (source_centers, ego_centers) in (
                             correspondences_by_source(seed_groups).items()
@@ -1265,6 +1533,8 @@ def main() -> None:
                         ) if direct_detections else []
                     for detection in corrected_fallback_detections:
                         groups.extend(simple_singleton_groups(detection))
+                    if args.trackformer_grouping == "all-agent-symmetric-pair":
+                        merge_component_counts(final_group_counts, group_counts(groups))
                     embedded = (
                         fuse_groups_score_weighted(groups)
                         if args.trackformer_box_fusion == "score-weighted"
@@ -1281,6 +1551,16 @@ def main() -> None:
                         ground_truth,
                         embedding_statistics,
                     )
+                    if args.trackformer_grouping == "all-agent-symmetric-pair":
+                        _merge_coverage(
+                            coverage_counts,
+                            _coverage_categories(
+                                detections_by_cav,
+                                ego_ground_truth,
+                                embedding_boxes,
+                                opencood_dataset.post_processor,
+                            ),
+                        )
                     embedding_fused_count += len(embedded["boxes"])
                     embedding_matched_groups += int(
                         (embedded["member_counts"] > 1).sum()
@@ -1304,7 +1584,7 @@ def main() -> None:
                 ego_detection = association_detections.get("ego")
                 propagated_sources = []
                 unselected_sources = []
-                for cav_id, _ in batch.items():
+                for cav_id in cav_order:
                     if cav_id == "ego":
                         continue
                     detection = association_detections[cav_id]
@@ -1360,6 +1640,9 @@ def main() -> None:
                         message_state, args.message_content_ablation
                     )
                     transmitted_message_bits += message_bits
+                    transmitted_message_bits += _message_overhead_bits(
+                        source, source_output["query_geometry"]
+                    )
                     message_code_count += code_count
                     transmitted_message_count += len(message_state)
                     source_embeddings = trackformer.association_embeddings(
@@ -1507,15 +1790,33 @@ def main() -> None:
             "heading_std_deg": args.heading_noise_std_deg,
             "time_delay_ms": args.time_delay_ms,
             "seed": args.noise_seed,
+            "mode": args.noise_mode,
         },
+        "covariance_noise_variant": args.covariance_noise_variant,
+        "assumed_position_noise_std_m": args.assumed_position_noise_std,
+        "assumed_heading_noise_std_deg": args.assumed_heading_noise_std_deg,
         "association_distance_m": args.association_distance,
         "embedding_distance_m": args.embedding_distance,
         "embedding_min_similarity": args.embedding_min_similarity,
         "message_content_ablation": args.message_content_ablation,
         "track_query_score_threshold": args.track_query_score_threshold,
+        "frame_cache": {
+            "directory": (
+                str(args.frame_cache_dir.resolve())
+                if args.frame_cache_dir is not None
+                else None
+            ),
+            "mode": args.frame_cache_mode,
+            "replayed": frame_cache.replay,
+            "artifact_boundary": (
+                "PointPillars decoded proposals, uncertainty, and ROI tokens; "
+                "PQ-STF states are recomputed for the requested checkpoint"
+            ),
+        },
         "ransac_localization": {
             "enabled": args.ransac_localization_correction,
             "seed_distance_m": args.ransac_seed_distance,
+            "seed_pair_min_probability": ransac_pair_min_probability,
             "inlier_threshold_m": args.ransac_inlier_threshold,
             "minimum_inliers": args.ransac_min_inliers,
             "minimum_relative_improvement": args.ransac_min_relative_improvement,
@@ -1534,6 +1835,24 @@ def main() -> None:
                 ransac_inlier_residual_sum / max(ransac_inliers, 1)
             ),
         },
+        "component_diagnostics": (
+            {
+                "pair_head": summarize_component_counts(
+                    pair_head_component_counts
+                ),
+                "ransac_seed_grouping": summarize_group_counts(
+                    ransac_seed_group_counts
+                ),
+                "final_grouping": summarize_group_counts(final_group_counts),
+                "ground_truth_coverage": _summarize_coverage(coverage_counts),
+                "label_source": (
+                    "OPV2V physical object IDs, evaluation only; never used "
+                    "by deployed association, RANSAC, or fusion"
+                ),
+            }
+            if args.trackformer_grouping == "all-agent-symmetric-pair"
+            else None
+        ),
         "trackformer_box_fusion": (
             args.trackformer_box_fusion if trackformer is not None else None
         ),

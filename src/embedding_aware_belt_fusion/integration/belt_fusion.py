@@ -352,6 +352,11 @@ def associate_by_symmetric_pair_head(
                 "covariance": detection["covariances"][index],
                 "query_state": detection["query_states"][index],
                 "query_geometry": detection["query_geometry"][index],
+                # Evaluation-only physical identity retained for component
+                # diagnostics.  It is never read by pair-head inference.
+                "oracle_object_id": (
+                    detection.get("oracle_object_ids", [None] * len(detection["boxes"]))[index]
+                ),
             }
             for index in range(len(detection["boxes"]))
         ]
