@@ -14,3 +14,12 @@
 	path = external/OpenCOOD-SWFormer
 	url = https://github.com/ShrootBuck/OpenCOOD.git
 	branch = feature/full-swformer
+[submodule "external/CoAlign"]
+	path = external/CoAlign
+	url = https://github.com/yifanlu0227/CoAlign.git
+[submodule "external/RoCo"]
+	path = external/RoCo
+	url = https://github.com/HuangZhe885/RoCo.git
+[submodule "external/CodeFilling"]
+	path = external/CodeFilling
+	url = https://github.com/PhyllisH/CodeFilling.git
