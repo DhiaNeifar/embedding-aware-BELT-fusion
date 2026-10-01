@@ -1,9 +1,13 @@
 import torch
 
+from embedding_aware_belt_fusion.evaluation.component_diagnostics import (
+    association_counts,
+)
 from embedding_aware_belt_fusion.integration.belt_fusion import (
     _constrained_assignment,
     associate_by_geometry,
     associate_by_symmetric_pair_head,
+    fuse_detections,
 )
 
 
@@ -93,3 +97,44 @@ def test_associate_by_geometry_recovers_both_valid_pairs_under_adversarial_cost(
     groups = associate_by_geometry([ego, source], maximum_distance=5.0)
     agent_sets = [frozenset(member["agent_id"] for member in group) for group in groups]
     assert agent_sets.count(frozenset({"ego", "source"})) == 2
+
+
+def _detection_with_ids(agent_id, boxes, oracle_object_ids):
+    boxes = torch.tensor(boxes, dtype=torch.float32)
+    count = len(boxes)
+    return {
+        "agent_id": agent_id,
+        "boxes": boxes,
+        "scores": torch.full((count,), 0.9),
+        "evidence": torch.tensor([[1.0, 4.0]]).repeat(count, 1),
+        "class_uncertainty": torch.full((count,), 0.25),
+        "covariances": torch.eye(7).repeat(count, 1, 1),
+        "oracle_object_ids": oracle_object_ids,
+    }
+
+
+def test_association_counts_catches_a_false_negative_group_counts_would_miss():
+    # Agent a has one box (object "obj1"). Agent b has two candidates: the
+    # true match "obj1" a bit further away, and a different physical object
+    # "obj2" that happens to sit closer. One-to-one Hungarian assignment
+    # picks the closer (wrong) one, leaving the true match as its own
+    # singleton group -- a false negative that never enters any group, so
+    # group_counts() alone (which only looks inside existing groups) cannot
+    # see it. association_counts() must still catch it as a missed candidate.
+    a = _detection_with_ids(
+        "a", boxes=[[0.0, 0.0, 0, 1, 1, 1, 0.0]], oracle_object_ids=["obj1"]
+    )
+    b = _detection_with_ids(
+        "b",
+        boxes=[[0.1, 0.0, 0, 1, 1, 1, 0.0], [0.05, 0.0, 0, 1, 1, 1, 0.0]],
+        oracle_object_ids=["obj1", "obj2"],
+    )
+    fused = fuse_detections([a, b], maximum_distance=5.0, association="geometry")
+    counts = association_counts(
+        [a, b], fused["groups"], maximum_distance=5.0
+    )
+    assert counts["candidate_pairs"] == 2
+    assert counts["positive_pairs"] == 1
+    assert counts["true_positive"] == 0
+    assert counts["false_positive"] == 1
+    assert counts["false_negative"] == 1

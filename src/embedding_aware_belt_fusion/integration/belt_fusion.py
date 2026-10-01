@@ -223,11 +223,17 @@ def associate_by_geometry(
             {
                 "agent_index": agent_index,
                 "agent_id": detection.get("agent_id", agent_index),
+                "proposal_index": index,
                 "box": detection["boxes"][index],
                 "score": detection["scores"][index],
                 "evidence": detection["evidence"][index],
                 "class_uncertainty": detection["class_uncertainty"][index],
                 "covariance": detection["covariances"][index],
+                # Evaluation-only physical identity retained for component
+                # diagnostics. It is never read by the deployed association.
+                "oracle_object_id": (
+                    detection.get("oracle_object_ids", [None] * len(detection["boxes"]))[index]
+                ),
             }
             for index in range(len(detection["boxes"]))
         ]
@@ -738,4 +744,4 @@ def fuse_detections(
         )
     else:
         raise ValueError(f"Unknown association mode: {association}")
-    return fuse_groups(groups)
+    return {**fuse_groups(groups), "groups": groups}

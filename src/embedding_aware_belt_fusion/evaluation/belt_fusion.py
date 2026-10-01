@@ -58,6 +58,7 @@ from embedding_aware_belt_fusion.evaluation.frame_cache import (
     to_device as cached_to_device,
 )
 from embedding_aware_belt_fusion.evaluation.component_diagnostics import (
+    association_counts,
     empty_counts as empty_component_counts,
     group_counts,
     merge_counts as merge_component_counts,
@@ -1013,6 +1014,7 @@ def main() -> None:
     naive_statistics = _statistics()
     ego_only_statistics = _statistics()
     belt_statistics = _statistics()
+    belt_association_counts = empty_component_counts()
     oracle_statistics = _statistics() if args.oracle_grouping else None
     oracle_max_score_statistics = (
         _statistics() if args.oracle_grouping else None
@@ -1173,6 +1175,14 @@ def main() -> None:
             )
             fused = fuse_detections(
                 detections, maximum_distance=args.association_distance
+            )
+            merge_component_counts(
+                belt_association_counts,
+                association_counts(
+                    detections,
+                    fused["groups"],
+                    maximum_distance=args.association_distance,
+                ),
             )
             belt_boxes, belt_scores = _postprocess_fused_boxes(
                 fused["boxes"],
@@ -1945,6 +1955,7 @@ def main() -> None:
         "naive_late": _ap(naive_statistics, args.global_sort_detections),
         "ego_only": _ap(ego_only_statistics, args.global_sort_detections),
         "belt_geometry": _ap(belt_statistics, args.global_sort_detections),
+        "belt_association": summarize_component_counts(belt_association_counts),
         **(
             {
                 "oracle_physical_id_score_weighted": _ap(
