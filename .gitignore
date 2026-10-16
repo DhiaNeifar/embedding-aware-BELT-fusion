@@ -204,7 +204,7 @@ cython_debug/
 tempCodeRunnerFile.py
 
 # Research data and generated artifacts
-data/
+/data/
 datasets/
 checkpoints/
 pointpillar_late_fusion*/
@@ -237,3 +237,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Large local-only resources (checkpoints, reference PDFs) — not versioned
+/models/
+/papers/
