@@ -6,8 +6,7 @@ frame. Each CAV's pose relative to ego is instead estimated from the last ``wind
 
 * measurement at frame t: the per-frame method's decided correction ``D_t`` gives ``Xhat_t = D_t o N_t``
   (``N_t`` = the CAV->ego transform from the CAV's reported, noisy pose); abstained frames give none. The
-  per-frame method is alignformer_c, or FreeAlign (its rigid correction refitted from its corrected boxes) for
-  the ablation that gives FreeAlign the same temporal estimator;
+  per-frame method is alignformer_c;
 * every stored measurement is carried to the current frame by both vehicles' own odometry between consecutive
   frames, ``X <- A o X o B`` (``A`` ego motion f-1 -> f, ``B`` CAV motion f -> f-1), each a noisy random walk.
   Per step and vehicle the drift sd is ``odometry_sd`` (fixed per frame) plus ``odometry_rel`` times the
@@ -57,13 +56,13 @@ from __future__ import annotations
 import zlib
 from collections import deque
 from dataclasses import dataclass, replace
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 from scipy.stats import chi2
 
 from embedding_aware_belt_fusion.alignformer_ext import odometry, verify_cpp
-from embedding_aware_belt_fusion.alignformer_ext.joint import compose, inverse
+from embedding_aware_belt_fusion.alignformer_ext.se2 import compose, inverse
 
 SCENARIO_JUMP_M = 5.0          # ego displacement between consecutive frame-table rows that marks a new scenario
 CAUCHY_C = 2.385               # Cauchy kernel constant (95% efficiency under Gaussian noise)
@@ -84,8 +83,6 @@ class TemporalSettings:
     window: int = 30                                  # frames
     scale_memory: int = 2000                          # residuals kept for the noise-scale estimate
     consistency: str = "off"                          # off | majority | adaptive (window-agreement Abstain)
-    source: str = "alignformer_c"                     # per-frame measurements: alignformer_c | freealign
-    calibration: Optional[dict] = None                # dataset scan-vs-pose offsets (calibration.py), or None
 
 
 def _pose2d(matrix) -> np.ndarray:
@@ -184,15 +181,13 @@ def _robust_gls(estimates: np.ndarray, odometry_covs: List[np.ndarray], noise: n
 
 
 def _robust_gls_agreement(estimates: np.ndarray, odometry_covs: List[np.ndarray], noise: np.ndarray,
-                          spread: np.ndarray = None, posterior: list = None):
+                          spread: np.ndarray = None):
     """``_robust_gls`` and the fraction of measurements agreeing with it: residual standardised by ``spread + C``
     (default ``noise + C``) within chi2(3) at ``CONSISTENCY_LEVEL``."""
     x = np.array([np.median(estimates[:, 0]), np.median(estimates[:, 1]),
                   np.arctan2(np.median(np.sin(estimates[:, 2])), np.median(np.cos(estimates[:, 2])))])
     n = len(estimates)
     if n == 1:
-        if posterior is not None:
-            posterior.append(noise + odometry_covs[0])
         return estimates[0].copy(), 1.0
     shared = np.empty((3 * n, 3 * n))
     for a in range(n):
@@ -216,39 +211,12 @@ def _robust_gls_agreement(estimates: np.ndarray, odometry_covs: List[np.ndarray]
         x[2] = _wrap(x[2])
         if np.abs(step).max() < 1e-7:
             break
-    if posterior is not None:
-        posterior.append(np.linalg.inv(normal))
     r = estimates - x
     r[:, 2] = _wrap(r[:, 2])
     if spread is not None:
         marginal = [np.linalg.inv(spread + cov) for cov in odometry_covs]
     agree = np.mean([float(ra @ m @ ra) <= _CONSISTENCY_BOUND for ra, m in zip(r, marginal)])
     return x, float(agree)
-
-
-def _freealign_measurements(inputs) -> np.ndarray:
-    """FreeAlign's per-frame corrections (P, 3: psi, tx, ty), refitted from its cached corrected boxes (it moves a
-    CAV's boxes rigidly); zero where it left the boxes unchanged (abstained)."""
-    from embedding_aware_belt_fusion.alignformer_pva.procrustes import weighted_se2_kabsch
-    import torch
-
-    cache = inputs.cache
-    out = np.zeros((len(cache["frame"]), 3), np.float32)
-    for p in range(len(cache["frame"])):
-        sl = slice(cache["cav_off"][p], cache["cav_off"][p + 1])
-        noisy, moved = cache["cav_boxes"][sl], cache["freealign_boxes"][sl]
-        if not len(noisy) or np.abs(moved[:, :2] - noisy[:, :2]).max() < 1e-5:
-            continue
-        if len(noisy) == 1:
-            psi = float(_wrap(moved[0, 6] - noisy[0, 6]))
-            c, s_ = np.cos(psi), np.sin(psi)
-            t = moved[0, :2] - np.array([c * noisy[0, 0] - s_ * noisy[0, 1], s_ * noisy[0, 0] + c * noisy[0, 1]])
-            out[p] = (psi, t[0], t[1])
-            continue
-        psi, t = weighted_se2_kabsch(torch.from_numpy(moved[None, :, :2]), torch.from_numpy(noisy[None, :, :2]),
-                                     torch.ones(1, len(noisy)))
-        out[p] = (float(psi), float(t[0, 0]), float(t[0, 1]))
-    return out
 
 
 def _measurements(inputs) -> np.ndarray:
@@ -261,14 +229,8 @@ def _measurements(inputs) -> np.ndarray:
     return inputs.scatter(decided)
 
 
-def temporal_decisions(inputs, settings: TemporalSettings = TemporalSettings(), uncertainty: dict = None) -> np.ndarray:
+def temporal_decisions(inputs, settings: TemporalSettings = TemporalSettings()) -> np.ndarray:
     """(P, 3) psi, tx, ty per cached pair from each CAV's robust fixed-lag pose estimate.
-
-    With ``uncertainty`` (a dict), also fills ``uncertainty["pose"][p]``: a (3, 3) covariance over (tx, ty, psi) of
-    the pose each pair ends up with, estimated from data only. For an applied window estimate it is the GLS
-    posterior with measurement noise at the measurements' total spread (``"posterior"``); where nothing is
-    applied it is the reported poses' error level (median reported-vs-estimate gap on passing windows, as
-    variance per axis), so an uncorrected CAV's boxes carry the localization error they actually have.
 
     Delayed messages (an asynchronous cache, async_cache.py, carries ``past_frame``): the reported pose and the CAV's
     odometry are the ones IN THE MESSAGE, i.e. of the frame it was produced at, placed in the ego's current frame;
@@ -279,11 +241,7 @@ def temporal_decisions(inputs, settings: TemporalSettings = TemporalSettings(), 
     from embedding_aware_belt_fusion.alignformer_ext.propose_cache import noisy_poses
 
     sigma, seed = float(cache["sigma"]), int(cache["seed"])
-    decided = _freealign_measurements(inputs) if settings.source == "freealign" else _measurements(inputs)
-    if settings.calibration is not None:
-        from embedding_aware_belt_fusion.alignformer_ext import calibration
-
-        decided = calibration.to_recorded_convention(inputs, decided, settings.calibration)
+    decided = _measurements(inputs)
     scale = _NoiseScale(settings.scale_memory)
     table = odometry.active()
 
@@ -350,9 +308,6 @@ def temporal_decisions(inputs, settings: TemporalSettings = TemporalSettings(), 
             noise = scale.matrix()
             measured = np.array([w for w, _, _ in window])
             x, agree = _robust_gls_agreement(measured, [cov for _, cov, _ in window], noise, scale.spread())
-            posterior = []
-            if uncertainty is not None:   # same window, measurement noise at its total spread; estimate unchanged
-                _robust_gls_agreement(measured, [cov for _, cov, _ in window], scale.spread(), posterior=posterior)
             if len(window) > 1 and window[-1][2] == 0:
                 residual = window[-1][0] - x
                 residual[2] = _wrap(residual[2])
@@ -369,20 +324,5 @@ def temporal_decisions(inputs, settings: TemporalSettings = TemporalSettings(), 
             if p is not None:
                 correction = compose(x, inverse(n))
                 out[p] = (correction[2], correction[0], correction[1])
-                if uncertainty is not None:
-                    uncertainty.setdefault("pose", {})[p] = posterior[0]
-                    # Window spread, not divided by n: measurement errors persist across frames (V2X-Real 0.31 m error
-                    # vs 0.15 m frame-to-frame), so the window mean does not average them down. Floor: the global
-                    # total spread (a single-measurement window has no spread of its own).
-                    r = measured - x
-                    r[:, 2] = _wrap(r[:, 2])
-                    own = np.diag([np.median(r[:, :2] ** 2) / CHI2_1_MEDIAN] * 2 + [np.median(r[:, 2] ** 2) / CHI2_1_MEDIAN])
-                    odo = np.mean([cov for _, cov, _ in window], axis=0)
-                    uncertainty.setdefault("window", {})[p] = (own if len(window) > 2 else scale.spread()) + odo
         windows = alive
-    if uncertainty is not None:
-        level = scale.localization_level()
-        t_var = (level ** 2 / 2.0 / CHI2_1_MEDIAN) if level is not None else 1.0
-        y_var = (float(np.median(scale.reported_yaw_error)) ** 2 / CHI2_1_MEDIAN) if scale.reported_yaw_error else 1e-4
-        uncertainty["reported"] = np.diag([t_var, t_var, y_var])
     return out

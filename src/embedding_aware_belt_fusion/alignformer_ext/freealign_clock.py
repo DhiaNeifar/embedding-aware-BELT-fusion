@@ -18,7 +18,7 @@ from typing import List
 import numpy as np
 import torch
 
-from embedding_aware_belt_fusion.alignformer_ext.joint import compose
+from embedding_aware_belt_fusion.alignformer_ext.se2 import compose
 from embedding_aware_belt_fusion.freealign.freealign import edge_features, mass_common_subgraph, robust_se2
 
 

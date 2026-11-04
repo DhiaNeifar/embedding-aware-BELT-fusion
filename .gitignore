@@ -243,3 +243,13 @@ __marimo__/
 /models/*
 !/models/README.md
 /papers/
+
+# LaTeX build files
+*.aux
+*.fdb_latexmk
+*.fls
+*.nav
+*.snm
+*.toc
+*.synctex.gz
+docs/**/*.out

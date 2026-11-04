@@ -209,7 +209,7 @@ def from_the_past(decided_sync: np.ndarray, sync_index: Dict[Tuple[int, int], in
     """(P, 3) psi, tx, ty for the async pairs: the decision a receiver makes at the message's timestamp (pair of
     frame g in the synchronous cache, ego boxes g <-> CAV boxes g) moved to now by the ego's own motion E:
     D_t = E o D_g o E^-1, so that D_t o (E o N_g) = E o (D_g o N_g)."""
-    from embedding_aware_belt_fusion.alignformer_ext.joint import compose, inverse
+    from embedding_aware_belt_fusion.alignformer_ext.se2 import compose, inverse
 
     out = np.zeros((len(cache["frame"]), 3), np.float32)
     for p in range(len(cache["frame"])):

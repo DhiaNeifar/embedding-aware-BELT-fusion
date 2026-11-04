@@ -1,3 +1,18 @@
+# AlignFormer
+
+Pose correction for cooperative perception from detected boxes: Propose (a transformer with Sinkhorn assignment and a
+closed-form pose), Verify (an exact RANSAC fit), Abstain (a Wald test), followed over time with each vehicle's own
+odometry, used as a plug-in for late and intermediate fusion. The paper is in `CVPR/` (outline and ledger in
+`CVPR/sec/00_glance.tex` and `CVPR/sec/9_ledger.tex`).
+
+- Code: `src/embedding_aware_belt_fusion/alignformer_ext` (around the unmodified `alignformer_pva` model).
+- Runs: `scripts/run_paper.sh` (see `scripts/README.md`). Weights: `models/README.md`. Data: `outputs/README.md`.
+- Submodules: `external/OpenCOOD`, `external/CoAlign`, `external/RoCo`, `external/CodeFilling`, `external/trackformer`.
+
+Everything below this line documents the project's earlier phase (BELT fusion, TrackFormer) and is kept for reference.
+
+---
+
 # Embedding-Aware BELT-Fusion
 
 This project studies robust cooperative LiDAR detection on OPV2V.  It starts

@@ -3,7 +3,7 @@
 import numpy as np
 
 from embedding_aware_belt_fusion.alignformer_ext import temporal
-from embedding_aware_belt_fusion.alignformer_ext.joint import compose
+from embedding_aware_belt_fusion.alignformer_ext.se2 import compose
 
 
 def test_carry_covariance_matches_monte_carlo():
@@ -59,15 +59,3 @@ def test_odometry_drift_scales_with_distance_and_vanishes_when_parked():
     _, moving = temporal._odometry(np.array([10.0, 0.0, 0.0]), settings, 0, 0, "cav")
     assert parked[0, 0] < 1e-10 and np.isclose(np.sqrt(moving[0, 0]), 0.055)
     assert np.isclose(np.degrees(np.sqrt(moving[2, 2])), 0.013)
-
-
-def test_alignment_confidence_tolerance_and_monotonicity():
-    from embedding_aware_belt_fusion.alignformer_ext import confidence
-
-    shrink = (1 - confidence.IOU_THRESHOLD) / (1 + confidence.IOU_THRESHOLD)
-    assert np.isclose(shrink * 1.9, 0.335, atol=1e-3)            # IoU 0.7 lost at a 0.33 m sideways shift of a car
-    w, l = 1.9, 4.5
-    for d in (0.1, 0.335, 0.6):                                    # IoU of two equal boxes shifted sideways by d
-        assert ((w - d) / (w + d) >= 0.7) == (d <= shrink * w + 1e-9)
-    prob = lambda s: 1 - np.exp(-(shrink * w) ** 2 / (2 * s ** 2))
-    assert prob(0.05) > prob(0.2) > prob(1.0)

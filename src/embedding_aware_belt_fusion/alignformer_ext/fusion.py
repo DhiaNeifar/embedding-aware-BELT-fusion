@@ -1,74 +1,12 @@
-"""Fusion experiments (ideas B and D): rewrite the boxes before the shared NMS (evaluate.score_condition's prefuse).
+"""Staleness-aware scores for delayed messages in late fusion.
 
-* ``ego_first``: a CAV box of an object the ego also sees NOW is dropped, so the ego's current box represents it;
-  CAV boxes of objects the ego does not see are kept. Under delay the ego's box is fresh and the CAV's is a
-  prediction; NMS instead keeps whichever has the higher detector score.
-* ``covariance_merge``: every CAV box carries a centre variance (detector noise, pose uncertainty, and the
-  prediction error over the delay); a CAV box associated with an ego box is merged into it by inverse-variance
-  weighting of the centres instead of being discarded, and CAV boxes of the same object from several CAVs are merged
-  the same way.
+Each CAV box's score is scaled by the probability that its predicted position stays within the IoU-0.7 tolerance,
+from the prediction errors the sender measures on its own tracks (``prediction_error_table``).
 """
 
 from __future__ import annotations
 
-from typing import Callable, List
-
 import numpy as np
-import torch
-
-
-def _centres(boxes: torch.Tensor) -> np.ndarray:
-    return boxes[:, :2].numpy().astype(np.float64) if len(boxes) else np.zeros((0, 2))
-
-
-def ego_first(gate_m: float = 2.0) -> Callable:
-    def prefuse(record, boxes: List[torch.Tensor], scores: List[torch.Tensor], pairs):
-        ego = _centres(boxes[0])
-        out_b, out_s = [boxes[0]], [scores[0]]
-        for b, s in zip(boxes[1:], scores[1:]):
-            c = _centres(b)
-            if len(ego) and len(c):
-                keep = np.linalg.norm(c[:, None] - ego[None], axis=2).min(axis=1) >= gate_m
-                b, s = b[torch.from_numpy(keep)], s[torch.from_numpy(keep)]
-            out_b.append(b)
-            out_s.append(s)
-        return out_b, out_s
-    return prefuse
-
-
-def covariance_merge(variance_of: Callable, gate_m: float = 2.0, ego_variance: float = 0.04) -> Callable:
-    """``variance_of(pair, box_index) -> centre variance (m^2)`` of a CAV box; the ego's boxes have
-    ``ego_variance``. Associated boxes (centre within ``gate_m``, nearest first) are merged into one box whose centre
-    is the inverse-variance weighted mean and whose score is the largest of the merged scores."""
-    def prefuse(record, boxes: List[torch.Tensor], scores: List[torch.Tensor], pairs):
-        clusters = []          # each: [sum w*c (2,), sum w, best box (7,), best score, kind]
-        for i in range(len(boxes[0])):
-            c = boxes[0][i, :2].numpy().astype(np.float64)
-            w = 1.0 / ego_variance
-            clusters.append([w * c, w, boxes[0][i].clone(), float(scores[0][i])])
-        for p, b, s in zip(pairs, boxes[1:], scores[1:]):
-            for j in range(len(b)):
-                c = b[j, :2].numpy().astype(np.float64)
-                w = 1.0 / max(float(variance_of(p, j)), 1e-6)
-                best, dist = None, gate_m
-                for k, cl in enumerate(clusters):
-                    d = float(np.linalg.norm(cl[0] / cl[1] - c))
-                    if d < dist:
-                        best, dist = k, d
-                if best is None:
-                    clusters.append([w * c, w, b[j].clone(), float(s[j])])
-                else:
-                    cl = clusters[best]
-                    cl[0], cl[1] = cl[0] + w * c, cl[1] + w
-                    if float(s[j]) > cl[3]:
-                        cl[2], cl[3] = b[j].clone(), float(s[j])
-        if not clusters:
-            return boxes, scores
-        merged = torch.stack([cl[2] for cl in clusters])
-        merged[:, :2] = torch.from_numpy(np.stack([cl[0] / cl[1] for cl in clusters])).to(merged.dtype)
-        merged_scores = torch.tensor([cl[3] for cl in clusters], dtype=scores[0].dtype)
-        return [merged], [merged_scores]
-    return prefuse
 
 
 SPEED_EDGES = (0.0, 0.1, 0.5, 1.0, np.inf)       # m per frame: <1, 1-5, 5-10, >10 m/s

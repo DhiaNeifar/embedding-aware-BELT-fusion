@@ -36,12 +36,10 @@ def apply_correction(boxes: torch.Tensor, psi: float, tx: float, ty: float) -> t
 
 def score_condition(base, records, cache: Dict[str, np.ndarray], decided: Optional[np.ndarray],
                     nms_thresh: float, oracle: bool = False, freealign: bool = False,
-                    score_scale: Optional[np.ndarray] = None, prefuse=None) -> Dict[str, Dict]:
+                    score_scale: Optional[np.ndarray] = None) -> Dict[str, Dict]:
     """Per-bucket TP/FP stats. ``decided`` (P, 3) psi, tx, ty per cached pair (zero = keep the noisy boxes);
     ``None`` scores the uncorrected boxes; ``oracle=True`` the true-pose boxes; ``freealign=True`` the cached
-    FreeAlign-corrected boxes. ``score_scale`` (flat, one per cached CAV box) multiplies the CAV boxes' scores.
-    ``prefuse(record, boxes, scores, pairs)`` (lists: ego first, then one entry per CAV pair) may rewrite the boxes
-    and scores before the shared NMS (fusion experiments, fusion.py)."""
+    FreeAlign-corrected boxes. ``score_scale`` (flat, one per cached CAV box) multiplies the CAV boxes' scores."""
     stats = {bucket: base.new_stats() for bucket in BUCKETS}
     pairs_by_frame: Dict[int, list] = {}
     for p, frame in enumerate(cache["frame"]):
@@ -73,8 +71,6 @@ def score_condition(base, records, cache: Dict[str, np.ndarray], decided: Option
             else:
                 scale = torch.from_numpy(score_scale[cav_off[p]:cav_off[p + 1]]).to(cav_scores.dtype)
                 scores.append(cav_scores * scale)
-        if prefuse is not None:
-            boxes, scores = prefuse(record, boxes, scores, pairs_by_frame.get(frame_index, []))
         corners = np.ascontiguousarray(
             base.box_utils.boxes_to_corners_3d(torch.cat(boxes).numpy(), order=base.box_order()), dtype=np.float32
         )

@@ -1,19 +1,9 @@
-[submodule "external/BELT-Fusion"]
-	path = external/BELT-Fusion
-	url = https://github.com/ZhiguoZhao/BELT-Fusion.git
 [submodule "external/trackformer"]
 	path = external/trackformer
 	url = https://github.com/timmeinhardt/trackformer.git
 [submodule "OpenCOOD"]
 	path = external/OpenCOOD
 	url = https://github.com/DerrickXuNu/OpenCOOD.git
-[submodule "external/mmdetection3d"]
-	path = external/mmdetection3d
-	url = https://github.com/open-mmlab/mmdetection3d.git
-[submodule "external/OpenCOOD-SWFormer"]
-	path = external/OpenCOOD-SWFormer
-	url = https://github.com/ShrootBuck/OpenCOOD.git
-	branch = feature/full-swformer
 [submodule "external/CoAlign"]
 	path = external/CoAlign
 	url = https://github.com/yifanlu0227/CoAlign.git

@@ -260,7 +260,8 @@ def refine_latency(grid: Dict[int, dict], cache, scenarios: List[str] = None, po
 
 
 def decide_at(records, cache, latency_frames: np.ndarray, model, robust_config, base):
-    """AlignFormer (Propose network + Verify + Abstain, unchanged) on the boxes moved by a per-pair latency."""
+    """The cache with each pair's boxes moved by its latency, and Propose re-run on them (the unchanged network):
+    (moved cache, PairInputs) for any variant to decide on."""
     from embedding_aware_belt_fusion.alignformer_ext import variants
 
     moved = dict(cache)
@@ -271,45 +272,4 @@ def decide_at(records, cache, latency_frames: np.ndarray, model, robust_config, 
     moved["cav_boxes"] = boxes
     inputs = variants.PairInputs(records, moved, model, robust_config, base=base)
     _propose(inputs, model, robust_config)
-    return moved, variants.alignformer(inputs), inputs
-
-
-def absorb_residual_motion(inputs, decided: np.ndarray, tau_used: np.ndarray, tau_error: np.ndarray, table: np.ndarray,
-                           k: float = 3.0) -> np.ndarray:
-    """After the pose decision (temporal layer + GPS confidence), absorb what the latency estimate got wrong.
-
-    GPS confidence governs the POSE: with an accurate GPS the decision stays on the reported pose. But when a delay
-    was detected and the boxes were moved forward by v tau, the boxes still carry the error of that prediction:
-    (tau_true - tau) v plus the sender's own prediction error, which no pose estimate contains. So, only for pairs
-    whose latency is non-zero, Verify (the deployed C++ RANSAC) is run from the pose decision against the ego's
-    CURRENT boxes, and its refit replaces the decision only if it moves every CAV box by less than k standard
-    deviations of that expected motion error (latency standard error x speed, plus the sender's prediction-error
-    variance at that horizon, fusion.prediction_error_table). Without a detected delay nothing changes."""
-    from embedding_aware_belt_fusion.alignformer_ext import evaluate, fusion
-
-    cache = inputs.cache
-    a = inputs.attempted
-    start = decided[a].astype(np.float32)
-    refined, engaged = verify_cpp.verify(
-        inputs.ego_rows, inputs.cav_rows, start, np.full(len(a), 1e6, np.float32), np.full(len(a), 3.0, np.float32),
-        inputs.model.variance_model, inputs.model.heading_lambda,
-    )[1:3]
-    out = decided.copy()
-    for i, p in enumerate(a):
-        if tau_used[p] <= 0.0 or not engaged[i]:
-            continue
-        rows = slice(cache["cav_off"][p], cache["cav_off"][p + 1])
-        speed = np.linalg.norm(cache["cav_velocity"][rows], axis=1)
-        h = float(np.clip(tau_used[p], 0, table.shape[1] - 1))
-        lo, frac = int(np.floor(h)), h - np.floor(h)
-        hi = min(lo + 1, table.shape[1] - 1)
-        bins = np.clip(np.searchsorted(fusion.SPEED_EDGES, speed, side="right") - 1, 0, table.shape[0] - 1)
-        prediction_var = (1.0 - frac) * table[bins, lo] + frac * table[bins, hi]
-        se = float(tau_error[p]) if np.isfinite(tau_error[p]) else float(tau_used[p])
-        tolerance = k * float(np.sqrt(np.median(se ** 2 * speed ** 2 + 2.0 * prediction_var)))
-        boxes = torch.from_numpy(cache["cav_boxes"][rows])
-        before = evaluate.apply_correction(boxes, *map(float, decided[p]))[:, :2]
-        after = evaluate.apply_correction(boxes, *map(float, refined[i]))[:, :2]
-        if float((before - after).norm(dim=1).max()) <= tolerance:
-            out[p] = refined[i]
-    return out
+    return moved, inputs

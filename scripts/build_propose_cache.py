@@ -42,12 +42,6 @@ def run(condition):
         tmp = path.with_suffix(".tmp.npz")
         np.savez(tmp, **cache)
         tmp.rename(path)
-    if _W["cavcav"] and not propose_cache.cavcav_path(_W["output_dir"], sigma, seed).exists():
-        cavcav = propose_cache.build_cavcav_condition(base, _W["records"], _W["model"], _W["robust"], sigma, seed)
-        path = propose_cache.cavcav_path(_W["output_dir"], sigma, seed)
-        tmp = path.with_suffix(".tmp.npz")
-        np.savez(tmp, **cavcav)
-        tmp.rename(path)
     return condition
 
 
@@ -60,14 +54,12 @@ def main() -> None:
     parser.add_argument("--seeds", type=int, default=20)
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/propose_cache_opv2v"))
     parser.add_argument("--workers", type=int, default=20)
-    parser.add_argument("--cavcav", action="store_true", help="also cache CAV<->CAV Propose (joint multi-CAV variants)")
     args = parser.parse_args()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     conditions = [
         (sigma, seed) for sigma in args.sigmas for seed in ([0] if sigma == 0.0 else range(args.seeds))
         if not propose_cache.condition_path(args.output_dir, sigma, seed).exists()
-        or (args.cavcav and not propose_cache.cavcav_path(args.output_dir, sigma, seed).exists())
     ]
     print(f"{len(conditions)} conditions to build in {args.output_dir}")
     if not conditions:
@@ -78,7 +70,6 @@ def main() -> None:
         robust=base.RobustSolveConfig(mode="huber", iterations=2),
         freealign=base.freealign_config_from_calibration(args.freealign_calibration),
         output_dir=args.output_dir,
-        cavcav=args.cavcav,
     )
     with cf.ProcessPoolExecutor(max_workers=args.workers, mp_context=mp.get_context("fork")) as pool:
         futures = [pool.submit(run, c) for c in conditions]

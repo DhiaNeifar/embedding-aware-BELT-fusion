@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Score AlignFormer variants on OPV2V from the Propose cache (C++ Verify; no network calls).
+"""Score AlignFormer variants in late fusion from the Propose cache (C++ Verify, NMS and AP; no network calls).
 
-Rows: uncorrected, oracle, freealign (cached, same noise draws), and every
-requested variant from ``alignformer_ext.variants`` (``alignformer`` = the
-deployed method, always included as the reference). AP per CAV bucket
+Rows: bare (the reported pose), oracle (the true pose), freealign (the baseline, cached on the same noise
+draws), and every requested variant from ``alignformer_ext.variants`` (``alignformer`` = the deployed one-frame
+method, always included as the reference). AP per CAV bucket
 (all / lt3 / ge3), mean and std over seeds. Build the cache first with
 ``scripts/build_propose_cache.py``.
 """
@@ -40,15 +40,10 @@ def run(path: Path):
         cache = {k: data[k] for k in data.files}
     records, nms = _W["records"], _W["nms"]
     ap = {
-        "uncorrected": evaluate.ap_table(base, evaluate.score_condition(base, records, cache, None, nms)),
+        "bare": evaluate.ap_table(base, evaluate.score_condition(base, records, cache, None, nms)),
         "freealign": evaluate.ap_table(base, evaluate.score_condition(base, records, cache, None, nms, freealign=True)),
     }
-    cavcav = None
-    cavcav_file = path.with_name("cavcav_" + path.name)
-    if cavcav_file.exists():
-        with np.load(cavcav_file) as data:
-            cavcav = {k: data[k] for k in data.files}
-    inputs = variants.PairInputs(records, cache, _W["model"], _W["robust"], cavcav=cavcav, base=base)
+    inputs = variants.PairInputs(records, cache, _W["model"], _W["robust"], base=base)
     for name in _W["variants"]:
         result = variants.VARIANTS[name](inputs)
         decided, scale = result if isinstance(result, tuple) else (result, None)   # (decided, CAV-box score scale)
@@ -76,12 +71,7 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=20)
     parser.add_argument(
         "--eval-range", type=float, nargs=2, default=[140.0, 40.0], metavar=("X", "Y"),
-        help="fusion_core's evaluation range |x|, |y| in metres: OPV2V 140 40 (default), V2X-Real 102.4 51.2, "
-             "CooperScene 102.4 40 (the cut its cached detections were made with).",
-    )
-    parser.add_argument(
-        "--calibration", type=Path, default=None,
-        help="dataset scan-vs-pose offsets JSON (scripts/measure_scan_pose_offsets.py) for the *_cal variants",
+        help="fusion_core's evaluation range |x|, |y| in metres: OPV2V 140 40 (default), V2X-Real 102.4 51.2.",
     )
     parser.add_argument(
         "--odometry", type=Path, default=None,
@@ -91,10 +81,6 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     base.fusion_core.set_filters(args.eval_range[0], args.eval_range[1], -3.0, 1.0, 6.0)
-    if args.calibration is not None:
-        from embedding_aware_belt_fusion.alignformer_ext import calibration
-
-        calibration.ACTIVE = calibration.load_offsets(args.calibration)
 
     names = ["alignformer"] + [v for v in args.variants if v != "alignformer"]
     paths = []
@@ -130,7 +116,7 @@ def main() -> None:
         per_seed.sort(key=lambda entry: entry["seed"])
 
     oracle = next(s["ap"]["oracle"] for s in results.get("0", [])) if "0" in results else None
-    rows = ["uncorrected", "freealign"] + names
+    rows = ["bare", "freealign"] + names
     summary = {}
     for sigma, per_seed in results.items():
         for bucket in evaluate.BUCKETS:
