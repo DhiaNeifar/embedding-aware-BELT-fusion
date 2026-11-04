@@ -1,0 +1,31 @@
+\begin{table*}[t]
+  \centering\small
+  \caption{\textbf{Delay, per $\sigma$, \ap{0.7}} on test, 3 paired seeds, with the \ap{0.5} / \ap{0.3} sweep means; the selected arm against \freealign at its val-AP threshold, both from the same result file.}
+  \label{tab:supp_delay}
+  \resizebox{\textwidth}{!}{\begin{tabular}{llcccc|c|cc|cc}
+    \toprule
+    & & \multicolumn{4}{c|}{\ap{0.7} at $\sigma$ =} & & \multicolumn{2}{c|}{\freealign} & \multicolumn{2}{c}{\paper} \\
+    dataset, delay & method & 0 & 0.4 & 1.0 & 2.0 & mean & \ap{0.5} & \ap{0.3} & \ap{0.5} & \ap{0.3} \\
+    \midrule
+    \vxreal, \SI{100}{ms} & uncorrected / oracle & .3421 / .3421 & .1991 & .1572 & .1640 & & & & & \\
+     & \freealign & .3035 & .2830 & .2752 & .2751 & .2842 & .4428 & .5124 & & \\
+     & \paper & \textbf{.3248} & \textbf{.2963} & \textbf{.2869} & \textbf{.2793} & \textbf{.2968} & & & .4728 & .5509 \\
+    \vxreal, \SI{200}{ms} & uncorrected / oracle & .3189 / .3189 & .1918 & .1563 & .1645 & & & & & \\
+     & \freealign & .2747 & .2561 & .2495 & .2495 & .2574 & .3846 & .4540 & & \\
+     & \paper & \textbf{.3045} & \textbf{.2744} & \textbf{.2647} & \textbf{.2585} & \textbf{.2755} & & & .4182 & .4982 \\
+    \vxreal, \SI{400}{ms} & uncorrected / oracle & .3136 / .3136 & .1952 & .1597 & .1655 & & & & & \\
+     & \freealign & .2698 & .2520 & .2450 & .2447 & .2529 & .3604 & .4040 & & \\
+     & \paper & \textbf{.3038} & \textbf{.2699} & \textbf{.2588} & \textbf{.2518} & \textbf{.2711} & & & .3891 & .4433 \\
+    \midrule
+    \opvv, \SI{100}{ms} & uncorrected / oracle & .3507 / .3507 & .1954 & .1682 & .1897 & & & & & \\
+     & \freealign & .6383 & .6348 & .6335 & .6343 & .6352 & .8451 & .9037 & & \\
+     & \paper & \textbf{.6465} & \textbf{.6419} & \textbf{.6412} & \textbf{.6403} & \textbf{.6425} & & & .8660 & .9308 \\
+    \opvv, \SI{200}{ms} & uncorrected / oracle & .2243 / .2243 & .1641 & .1710 & .1944 & & & & & \\
+     & \freealign & .4974 & .4966 & .4971 & .4978 & .4972 & .7061 & .8235 & & \\
+     & \paper & \textbf{.5085} & \textbf{.5055} & \textbf{.5064} & \textbf{.5050} & \textbf{.5064} & & & .7295 & .8599 \\
+    \opvv, \SI{400}{ms} & uncorrected / oracle & .2607 / .2607 & .2220 & .2075 & .2076 & & & & & \\
+     & \freealign & .3828 & .3822 & .3822 & .3820 & .3823 & .5605 & .6629 & & \\
+     & \paper & \textbf{.4068} & \textbf{.4028} & \textbf{.4016} & \textbf{.3967} & \textbf{.4020} & & & .5880 & .7152 \\
+    \bottomrule
+  \end{tabular}}
+\end{table*}

@@ -43,6 +43,23 @@ def parse_args():
     parser.add_argument("--temperature", type=float, default=0.07)
     parser.add_argument("--candidate-distance", type=float, default=5.0)
     parser.add_argument("--match-probability", type=float, default=0.90)
+    parser.add_argument(
+        "--threshold-sweep",
+        type=float,
+        nargs="+",
+        help=(
+            "Evaluate these pair-head probability gates in one pass. This is "
+            "a diagnostic only; it does not retrain the model."
+        ),
+    )
+    parser.add_argument(
+        "--select-minimum-precision",
+        type=float,
+        help=(
+            "With --threshold-sweep, recommend the threshold with greatest "
+            "recall whose precision reaches this value."
+        ),
+    )
     parser.add_argument("--hard-negative-ratio", type=int, default=4)
     parser.add_argument("--max-frames", type=int)
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
@@ -107,6 +124,10 @@ def main():
     correct, total, shared, retrieval_pairs, losses = 0.0, 0, 0, 0, []
     true_positive = false_positive = false_negative = 0
     candidate_pairs = positive_pairs = binary_agent_pairs = 0
+    threshold_counts = {
+        float(threshold): {"true_positive": 0, "false_positive": 0, "false_negative": 0}
+        for threshold in (args.threshold_sweep or [])
+    }
     with torch.no_grad():
         progress = tqdm(loader, desc=f"all-agent {args.method}")
         for frames in progress:
@@ -153,6 +174,18 @@ def main():
                         positive_pairs += record["positive_pairs"]
                         binary_agent_pairs += 1
                         losses.append(float(record["loss"]))
+                        for threshold, counts in threshold_counts.items():
+                            sweep_record = binary_pair_loss_and_metrics(
+                                scores,
+                                agent_a,
+                                agent_b,
+                                maximum_distance=args.candidate_distance,
+                                probability_threshold=threshold,
+                                negative_ratio=args.hard_negative_ratio,
+                            )
+                            counts["true_positive"] += sweep_record["true_positive"]
+                            counts["false_positive"] += sweep_record["false_positive"]
+                            counts["false_negative"] += sweep_record["false_negative"]
             if args.method == "direct":
                 progress.set_postfix(top1=f"{correct / max(total, 1):.3f}")
             else:
@@ -201,6 +234,31 @@ def main():
                 "unmatched proposals and different physical IDs are negatives."
             ),
         })
+        if threshold_counts:
+            curve = []
+            for threshold, counts in sorted(threshold_counts.items()):
+                precision = counts["true_positive"] / max(
+                    counts["true_positive"] + counts["false_positive"], 1
+                )
+                recall = counts["true_positive"] / max(
+                    counts["true_positive"] + counts["false_negative"], 1
+                )
+                curve.append({
+                    "threshold": threshold,
+                    "precision": precision,
+                    "recall": recall,
+                    "f1": 2 * precision * recall / max(precision + recall, 1e-8),
+                })
+            result["threshold_curve"] = curve
+            if args.select_minimum_precision is not None:
+                eligible = [
+                    point for point in curve
+                    if point["precision"] >= args.select_minimum_precision
+                ]
+                result["recommended_threshold"] = (
+                    max(eligible, key=lambda point: (point["recall"], point["f1"]))
+                    if eligible else None
+                )
     args.output_dir.mkdir(parents=True, exist_ok=True)
     (args.output_dir / "metrics.json").write_text(json.dumps(result, indent=2) + "\n")
     print("ALL_AGENT " + json.dumps(result, sort_keys=True))

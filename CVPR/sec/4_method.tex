@@ -1,0 +1,41 @@
+\section{AlignFormer}
+\label{new:sec:method}
+\budget{2 pages, 13 paragraphs, Fig.~F2. Each paragraph describes code that runs in the final experiments, nothing else (R2).}
+
+\begin{figure}[t]
+  \centering
+  \placeholderfig{\linewidth}{2.8cm}{\textbf{F2: the pipeline.} Per frame: Propose $\to$ Verify. Over time: carry by odometry $\to$ robust pooling $\to$ online Abstain $\to$ corrected transform. Late fusion only: latency fit and staleness score. Drawn in TikZ, no run needed.}
+  \caption{\textbf{F2.} The stages. Nothing in the pipeline reads a noise level.}
+\end{figure}
+
+\subsection{Overview}
+\para{The whole pipeline in one paragraph}{Input, stages, output, each in a sentence, following Fig.~F2. Repeat that no stage reads a noise level.}
+
+\subsection{One frame: Propose, Verify, Abstain}
+\para{Propose}{A small transformer over box tokens, Sinkhorn soft assignment with dustbins for unshared objects, and a closed-form, heading-augmented, inverse-variance-weighted Kabsch pose, with two robust reweighting steps. Differentiable end to end, so the matcher is trained on the pose it produces. Trained once per dataset, separately from any host; the host's training is untouched. Declare the training noise range ($\leq 2$\,m) here; T5 tests beyond it. \code{alignformer_pva}}
+
+\para{Verify}{An exact re-solve: mutual nearest neighbours under the proposed pose, shrinking gates, RANSAC. Heading plays no part in the fit, a choice confirmed on validation. \code{verify_core, variants.alignformer_c}}
+
+\para{Abstain}{Should this pair be corrected at all? A Wald test of the proposed correction against no correction, using the covariance the weighted solve implies and a fitted noise model for the detections, so it needs no noise level. An agreement rule between the proposal and the exact fit, with a consensus floor, decides which fit to keep. \code{abstain.py, verify_core}}
+
+\para{Why all three}{The soft fit is never catastrophically wrong, the hard fit is sharp when its matches are right, and the test protects the case where no correction is needed. Short, with the evidence in T4 and T7.}
+
+\subsection{Over time}
+\para{Carrying measurements}{Each frame gives a measurement of the CAV's pose. Both vehicles' odometry carries it to the current frame, with its covariance propagated through exact Jacobians. Odometry is real LiDAR odometry from each vehicle's own scans, with a fixed published accuracy, never the simulator's. \code{temporal._carry} \code{odometry.py, build_odometry_table.py}}
+
+\para{Robust pooling}{Generalised least squares over a 30-frame window. Carried measurements share odometry, so they are correlated, and the estimator models that. Outliers are down-weighted by a Cauchy kernel. Measurement noise is estimated online from consecutive differences, so nothing is assumed about it. \code{temporal._robust_gls_agreement, temporal._NoiseScale}}
+
+\subsection{Abstain over time}
+\para{When to keep the reported pose}{The per-frame test sees one frame; this one sees the window. It is a choice between two estimates: the reported pose and the window's. The window is applied if most of its measurements agree with it, or if its spread is below the reported pose's error level, which is itself estimated online from past gaps. No threshold depends on the noise level. \code{temporal.temporal_decisions, consistency="adaptive"}}
+
+\subsection{Delay (late fusion)}
+\para{Why delay is a different problem}{A delay moves objects by their own velocity, so the error is no longer rigid and no single transform can fix it. Without a motion model, alignment fits the moving objects' displacement and misplaces the rest.}
+
+\para{Joint pose and latency}{Fit pose and latency together from matched boxes and the sender's velocities. An F-test decides whether a delay exists, and velocity diversity measures whether it is observable at all; identical motion is indistinguishable from a translation. Estimates are pooled per CAV before testing. \code{latency.joint_fit, latency.refine_latency}}
+
+\para{Staleness-aware scores}{Scale each delayed box's score by the probability its predicted position stays within the IoU tolerance, using the sender's own tracking errors. Tracker and table use the same real odometry, and the table is fitted on validation frames. \code{fusion.staleness_confidence} \tobuild{tracker on real odometry, validation table}}
+
+\subsection{Plugging in}
+\para{Hooking into a host}{Late fusion: corrected transform and scores go to NMS. Intermediate: replace the matrix, nothing else; same weights. State the limits now: the module needs per-agent boxes from its own detector, as CoAlign's stage one does, and intermediate hosts get the pose correction only, since feature maps have no per-object motion compensation. \tobuild{plugin.py, intermediate_sweep.py}}
+
+\para{Cost}{What is added to the message (boxes, scores, odometry step, velocities), in bytes, and runtime per frame. Numbers from T7.}

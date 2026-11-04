@@ -1,0 +1,36 @@
+\begin{table}[t]
+  \centering\small
+  \caption{\textbf{Test under communication delay}, sweep means over $\sigma\in\{0,0.4,1,2\}$, 3 paired seeds; propose+verify+agree is the full method before the consensus floor. Last column: the full method.}
+  \label{tab:delay}
+  \resizebox{\linewidth}{!}{\begin{tabular}{llcccc}
+    \toprule
+    delay & metric & oracle & propose+verify+agree & \freealign & \paper \\
+    \midrule
+    \multicolumn{6}{l}{\textit{\vxreal}} \\
+    \multirow{3}{*}{\SI{100}{ms}} & \ap{0.7} & .3421 & .2865 & .2842 & \textbf{.2968} \\
+     & \ap{0.5} & .5588 & .4562 & .4428 & \textbf{.4728} \\
+     & \ap{0.3} & .6075 & .5349 & .5124 & \textbf{.5509} \\
+    \addlinespace
+    \multirow{3}{*}{\SI{200}{ms}} & \ap{0.7} & .3189 & .2639 & .2574 & \textbf{.2755} \\
+     & \ap{0.5} & .4815 & .4002 & .3846 & \textbf{.4182} \\
+     & \ap{0.3} & .5673 & .4818 & .4540 & \textbf{.4982} \\
+    \addlinespace
+    \multirow{3}{*}{\SI{400}{ms}} & \ap{0.7} & .3136 & .2581 & .2529 & \textbf{.2711} \\
+     & \ap{0.5} & .4463 & .3713 & .3604 & \textbf{.3891} \\
+     & \ap{0.3} & .4880 & .4277 & .4040 & \textbf{.4433} \\
+    \midrule
+    \multicolumn{6}{l}{\textit{\opvv}} \\
+    \multirow{3}{*}{\SI{100}{ms}} & \ap{0.7} & .3507 & .6383 & .6352 & \textbf{.6425} \\
+     & \ap{0.5} & .8546 & .8624 & .8451 & \textbf{.8660} \\
+     & \ap{0.3} & .9533 & .9280 & .9037 & \textbf{.9308} \\
+    \addlinespace
+    \multirow{3}{*}{\SI{200}{ms}} & \ap{0.7} & .2243 & .4976 & .4972 & \textbf{.5064} \\
+     & \ap{0.5} & .4072 & .7191 & .7061 & \textbf{.7295} \\
+     & \ap{0.3} & .7915 & .8539 & .8235 & \textbf{.8599} \\
+    \addlinespace
+    \multirow{3}{*}{\SI{400}{ms}} & \ap{0.7} & .2607 & .3873 & .3823 & \textbf{.4020} \\
+     & \ap{0.5} & .3427 & .5644 & .5605 & \textbf{.5880} \\
+     & \ap{0.3} & .4475 & .6935 & .6629 & \textbf{.7152} \\
+    \bottomrule
+  \end{tabular}}
+\end{table}

@@ -1,0 +1,18 @@
+\begin{table*}[t]
+  \centering\small
+  \caption{\textbf{Misalignment-correction approaches by technical category.} Bandwidth is per agent per frame. ``Min.\ shared objects'' is the fewest co-visible detections a method needs to produce a correction.}
+  \label{tab:related}
+  \resizebox{\linewidth}{!}{\begin{tabular}{p{2.6cm}p{2.3cm}p{1.6cm}p{1.1cm}p{3.6cm}}
+    \toprule
+    Category & Representative methods & Fusion stage & Min.\ shared objects & Limitation for box misalignment \\
+    \midrule
+    Pose-unaware intermediate fusion & V2VNet~\cite{wang2020v2vnet}, AttFuse~\cite{xu2022opv2v}, V2X-ViT~\cite{xu2022v2xvit}, CoBEVT~\cite{xu2022cobevt}, Where2comm~\cite{hu2022where2comm}, F-Cooper~\cite{chen2019fcooper} & Intermediate (shared BEV features) & n/a & Assumes exact pose; a pose error propagates directly into the fused feature map \\
+    \addlinespace
+    Pose-robust intermediate fusion & Vadivelu \etal~\cite{vadivelu2020learning}, CoAlign~\cite{lu2023coalign}, MRCNet~\cite{hong2024mrcnet} & Intermediate (shared BEV features) & n/a & Corrects pose inside the feature pipeline; needs a jointly trained backbone on every agent and megabytes of bandwidth per frame \\
+    \addlinespace
+    Pose-robust late fusion & RoCo~\cite{huang2024roco}, \freealign~\cite{lei2024freealign} & Late (detected boxes) & 3 (\freealign) & Relative-distance graph is degenerate below 3 shared objects; exact fit over a wrong hard match is exactly wrong \\
+    \addlinespace
+    Ours & \paper & Late (detected boxes) & 1 & --- \\
+    \bottomrule
+  \end{tabular}}
+\end{table*}

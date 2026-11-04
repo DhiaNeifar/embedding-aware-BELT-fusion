@@ -1,0 +1,70 @@
+\section{Experiments}
+\label{new:sec:experiments}
+\budget{3.5 pages, 7 tables, 3 figures. Every subsection opens with its claim and is built around its exhibit. This section decides what we run.}
+
+%% ------------------------------------------------------------------------------------------------
+\subsection{Protocol}
+\para{Datasets}{OPV2V (simulated, test 2,170 frames) and V2X-Real (real, test 2,172 frames). One simulated control, one real test. Each has its own pose head, trained on its own training split.}
+
+\para{Hosts}{Unmodified, with their published or supplied weights. OPV2V: AttFuse, CoAlign fusion, CoBEVT, F-Cooper, V2VAM, V2X-ViT, Where2comm. V2X-Real: AttFuse, F-Cooper, V2X-ViT, plus CoST and Where2comm if their fusion code arrives. Both hook points are covered: points before voxelization on OPV2V, features after the encoder on V2X-Real. Trained without pose noise unless stated.}
+
+\para{Noise}{Applied to the CAV's pose only: $x,y\sim\mathcal{N}(0,\sigma)$\,m, yaw $\sim\mathcal{N}(0,\sigma)$\,deg, independently per frame and CAV, the field's benchmark. Late fusion: 8 levels, 20 seeds. Hosts: $\sigma\in\{0,0.4,1,2\}$, 3 seeds. Draws are shared across all methods, so every comparison is paired. T5 adds noise kinds the benchmark lacks.}
+
+\para{What the plug-in receives (R1)}{Repeat the system-model list, this time as an experimental fact: the simulator alone knows $\sigma$. Odometry is KISS-ICP on each vehicle's own scans, and its accuracy against recorded poses is in the supplement. \code{odometry.py, build_odometry_table.py}}
+
+\para{Evaluator}{One AP implementation at IoU 0.3, 0.5, 0.7. Per dataset, every method uses the same frames, ego, CAV set and ground-truth window; where a host's dataset code differs, the harness overrides it. Late fusion: NMS at 0.15.}
+
+\para{Baselines}{Perfect pose (upper bound). Uncorrected. Ego only. FreeAlign, reimplemented on our detections and evaluator with parameters selected on validation, and as a plug-in on hosts, as its authors report it. Under delay, FreeAlign also with its authors' clock search. Built-in correctors: CoAlign's pose graph, RoCo.}
+
+\para{Selection (R3)}{Window length, verification settings and the delay estimator are chosen once on V2X-Real validation and frozen. No test set informs any choice. The pose head was trained with noise up to 2\,m, declared here and tested beyond in T5.}
+
+%% ------------------------------------------------------------------------------------------------
+\subsection{The plug-in on intermediate fusion}
+\input{tables/t1_hosts}
+\input{figures/f3_curves}
+\para{Claim and collapse \claimref{C1}}{Opening sentence states C1. Read the uncorrected columns: every host loses most of its AP by $\sigma=1$, and many fall below the ego alone. This is what the plug-in has to repair.}
+
+\para{Recovery}{Read the AlignFormer columns against perfect pose: retention per host, with weights and code unchanged. At $\sigma=0$ the plug-in does no harm. Fig.~F3 shows the curves for one host per dataset, V2X-ViT, fixed now so it is not chosen after seeing results.}
+
+\para{Against FreeAlign on the same hosts}{The paper's real test, because FreeAlign's authors already showed that hosts recover with their module. Same noise draws, same hosts, only the module changes. Report the margin per host with its paired standard error, including the clean-case gap at $\sigma=0$, and do not oversell it.}
+
+\para{Across hook points and datasets}{Does it hold on real data, and where the transform enters features rather than points? Each dataset uses one hook point, so the two effects cannot be separated, and we say so. Fig.~F4: one V2X-Real frame, before and after, chosen by a fixed rule (median per-frame gain).}
+
+%% ------------------------------------------------------------------------------------------------
+\subsection{Replacing built-in correction}
+\input{tables/t2_builtin}
+\para{Claim and result \claimref{C2}}{The cleanest test of the plug-in idea: same weights, only the corrector changes. CoAlign's agent-object pose graph and RoCo's iterative matching against AlignFormer and FreeAlign. OPV2V only, since these checkpoints exist only there. Say why it matters: their correction needs a network-specific stage, ours does not.}
+
+%% ------------------------------------------------------------------------------------------------
+\subsection{Late fusion against FreeAlign}
+\input{tables/t3_late}
+\input{tables/t4_pose}
+\para{Result \claimref{C3}}{Read T3: above FreeAlign at every $\sigma$ on both datasets, with paired statistics over 20 seeds. Full 8-level tables in the supplement.}
+
+\para{Why}{Read T4: pose error and coverage, independent of any host. Fewer large errors, and pairs with few shared objects get answered, which is where graph matching declines. This table also explains T1: better pose is why hosts recover.}
+
+\para{Where it does not win}{Say it before a reviewer does. Read the ego-only row: at AP$_{0.7}$ on V2X-Real the headroom over the ego is small, and we say what that means.}
+
+%% ------------------------------------------------------------------------------------------------
+\subsection{No noise knowledge}
+\input{tables/t5_noise}
+\para{Claim and setup \claimref{C4}}{The frozen configuration faces noise it never saw, all at 1\,m RMS unless stated. Slow drift: Gauss--Markov, 10\,s time constant, like real GNSS. Constant bias: one draw per CAV per scene. Mixed quality: each CAV per scene draws its own $\sigma$. Beyond training: $\sigma=5$\,m. No re-tuning between rows.}
+
+\para{What it shows}{Read T5 row by row against FreeAlign. Slow drift and constant bias test the temporal stage, whose pooling could suffer when errors no longer average out. Mixed quality tests online Abstain, whose error level assumes similar quality across CAVs. Beyond training tests the learned Propose against FreeAlign, which has no range. Any failure is reported as a limit.}
+
+%% ------------------------------------------------------------------------------------------------
+\subsection{Unknown delay in late fusion}
+\input{tables/t6_delay}
+\input{figures/f5_latency}
+\para{Claim and setup \claimref{C5}}{A message is 0, 100, 200 or 400\,ms old, with stale boxes, scores and pose. The plug-in is not told. OPV2V and V2X-Real. Late fusion only, because feature maps have no per-object motion compensation.}
+
+\para{Result}{Read T6 against both FreeAlign rows, and the row told the true delay as an upper bound. The clock-search row has no motion compensation, because SyncNet works on feature maps; say so, for fairness. Say what each stage adds: latency, then staleness scores.}
+
+\para{Latency recovered and zero delay unharmed}{Fig.~F5: estimated against true delay, including cases where delay is unobservable and the test correctly declines. The 0\,ms column must match the no-delay-stage result, which shows the stage is safe to leave on.}
+
+%% ------------------------------------------------------------------------------------------------
+\subsection{Ablation and cost}
+\input{tables/t7_ablation}
+\para{Ablation \claimref{C6}}{One stage added per row. Every stage must help on at least one dataset and hurt on neither, or it leaves the paper and the code (R6). All rows come from runs already made for T3 and T6.}
+
+\para{Cost}{Bytes added to the message, against each host's message size, and runtime per frame on one CPU core. This is the practical half of the plug-in argument.}

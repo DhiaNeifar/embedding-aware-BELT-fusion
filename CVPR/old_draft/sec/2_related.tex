@@ -1,0 +1,26 @@
+\section{Related Work}
+\label{sec:related}
+
+\input{tables/related_work}
+
+\paragraph{Cooperative perception and its bandwidth.}
+V2VNet~\cite{wang2020v2vnet}, OPV2V's AttFuse~\cite{xu2022opv2v}, V2X-ViT~\cite{xu2022v2xvit}, CoBEVT~\cite{xu2022cobevt}, Where2comm~\cite{hu2022where2comm} and F-Cooper~\cite{chen2019fcooper} fuse intermediate BEV features. They set the accuracy ceiling under exact poses and cost megabytes per frame. Late fusion exchanges detected boxes and is the cheapest and most detector-agnostic option. It is also the one whose output depends entirely on the sender's pose being right, which is the problem this paper addresses. Our byte accounting follows OPV2V's convention and charges each method only for what its alignment step adds to the shared box payload.
+
+\paragraph{Pose-error-robust fusion.}
+Vadivelu \etal~\cite{vadivelu2020learning} regress a pose correction from fused features and smooth it over the agent graph with a Markov random field. CoAlign~\cite{lu2023coalign} optimises an agent-object pose graph and is the reference robust intermediate method. MRCNet~\cite{hong2024mrcnet} handles pose error and delay together inside the feature pipeline. These need a jointly trained backbone on every agent and the bandwidth that comes with it. On the late-fusion side, RoCo~\cite{huang2024roco} alternates object matching with pose adjustment, and \freealign~\cite{lei2024freealign} removes the pose prior entirely by matching relative-distance graphs and fitting with a robust estimator. \freealign is the comparison that matters for us. It sends the same bytes, needs no localization, and its published ablations put it ahead of CoAlign under large noise. We reimplement it onto our detector and evaluator (Sec.~\ref{sec:protocol}) because its released code is bound to a different detector, postprocessor and AP implementation, and we select its edge threshold on validation AP rather than on pose error, which turns out to matter by 0.06 AP. Fig.~\ref{fig:degenerate} shows why shared-object count affects the two families differently.
+
+\begin{figure}[t]
+  \centering
+  \resizebox{\linewidth}{!}{\input{figures/degenerate}}
+  \caption{\textbf{Why shared-object count matters differently.} A relative-distance graph has one edge over two shared objects, consistent with more than one rotation, and is rigid only from three objects onward. A single shared object with a heading already fixes rotation and translation, so a learned matcher that uses heading can answer pairs a relative-distance graph cannot.}
+  \label{fig:degenerate}
+\end{figure}
+
+\paragraph{Learned matching and robust registration.}
+Our proposal stage is SuperGlue-style~\cite{sarlin2020superglue} attention over two sets with a Sinkhorn~\cite{cuturi2013sinkhorn} assignment and dustbins. The closed-form pose is a weighted Kabsch~\cite{kabsch1976solution} fit. The verification is ICP~\cite{besl1992icp} initialised by the learned estimate with a RANSAC~\cite{fischler1981ransac} inner solve. The robust weighting is Huber IRLS~\cite{huber1964robust}. The abstention is a Wald test~\cite{wald1943tests}. None of these is new. What is new is the composition for this problem, a learned stage that decides \emph{which} correspondences to fit, an exact stage that fits them without blur, and a decision rule that uses the two estimates against each other. We show in Sec.~\ref{sec:ablation} that each stage is worth a measurable amount of AP and that the composition is what overtakes a tuned \freealign.
+
+\paragraph{Asynchrony.}
+SyncNet~\cite{lei2022syncnet} and CoBEVFlow~\cite{wei2023cobevflow} compensate communication delay by predicting feature motion. We do not model delay. We measure it, because it is a different error from localization. Static objects arrive correctly placed and moving ones do not, so a rigid correction cannot repair it, and a robust solver must simply not be dragged off by the moving minority. Sec.~\ref{sec:delay} reports both methods under \SIrange{100}{400}{ms}.
+
+\paragraph{Appearance for cross-agent association.}
+Re-identification features are the standard cue for associating detections across cameras. We test the hypothesis directly, from colour histograms through frozen ImageNet features to a cross-agent contrastive head on DINOv2~\cite{oquab2023dinov2} patch features, and find it does not move the matcher on either dataset (Sec.~\ref{sec:appearance}). The reason is measurable and we report it.

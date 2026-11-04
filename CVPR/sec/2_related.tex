@@ -1,0 +1,10 @@
+\section{Related Work}
+\budget{0.5 page, 4 paragraphs. Each ends by saying what is different here. References checked before writing.}
+
+\para{Intermediate fusion under pose error}{Attention and transformer hosts (AttFuse, V2X-ViT, CoBEVT, Where2comm, CoST) gain robustness, if at all, through training with noise. They remain our hosts. \emph{Difference:} we do not compete with them, we repair them.}
+
+\para{Pose correction built into a network}{Vadivelu et al., CoAlign's pose graph, MRCNet, SparseAlign's PoseAlign (learned pose-agnostic box features, then a pose graph), CoRA, FeaKM, V2VLoc. RoCo's matching and pose graph, which claims integration without retraining, single frame, with a distance gate. \emph{Difference:} tested on many unchanged hosts, and compared with CoAlign and RoCo directly in Table~T2 on the same weights.}
+
+\para{Alignment from boxes, and plug-ins}{FreeAlign: graph matching, plugs into hosts without retraining, works without GNSS (its paper mentions checking GNSS reliability in passing). Its limits: degenerate below three shared objects, exact fit only as good as its hard matches. OptiMatch's optimal-transport matching for object-level correction. \emph{Difference:} learned association plus exact verification, pooled over time, using the reported pose when the evidence supports it.}
+
+\para{Delay and time}{Latency compensation with known or separately estimated delay (SyncNet, CoBEVFlow). FreeAlign's clock search, which leaves motion to SyncNet on feature maps, so late fusion gets none. NEAT absorbs delay implicitly in features. CoAnchor and SparseAlign use short histories, CoAnchor with the delay given. \emph{Difference:} the delay is estimated jointly with the pose, from boxes and sender velocities, and tested for observability.}

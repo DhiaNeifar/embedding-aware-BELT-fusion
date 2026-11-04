@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import math
-from itertools import combinations
 from typing import Iterable, Mapping
 
 import torch
@@ -44,6 +43,36 @@ def _refine_se2(source: Tensor, target: Tensor) -> tuple[Tensor, Tensor]:
     return rotation, target_center - rotation @ source_center
 
 
+def _batched_se2_from_pairs(
+    source_first: Tensor,
+    source_second: Tensor,
+    target_first: Tensor,
+    target_second: Tensor,
+) -> tuple[Tensor, Tensor]:
+    """Batched planar rigid transform from one point-pair per hypothesis.
+
+    Vectorized form of :func:`_se2_from_two_pairs` over a leading hypothesis
+    dimension ``H``. All inputs are ``(H, 2)``; returns rotation ``(H, 2, 2)``
+    and translation ``(H, 2)``.
+    """
+    source_delta = source_second - source_first
+    target_delta = target_second - target_first
+    angle = torch.atan2(
+        source_delta[:, 0] * target_delta[:, 1] - source_delta[:, 1] * target_delta[:, 0],
+        (source_delta * target_delta).sum(dim=-1),
+    )
+    cosine, sine = torch.cos(angle), torch.sin(angle)
+    rotation = torch.stack(
+        [
+            torch.stack([cosine, -sine], dim=-1),
+            torch.stack([sine, cosine], dim=-1),
+        ],
+        dim=-2,
+    )
+    translation = target_first - torch.einsum("hij,hj->hi", rotation, source_first)
+    return rotation, translation
+
+
 def estimate_se2_ransac(
     source_centers: Tensor,
     ego_centers: Tensor,
@@ -57,29 +86,64 @@ def estimate_se2_ransac(
     correction is relative: it says how the source's current ego-frame boxes
     should move to agree with the ego CAV, not which vehicle is absolutely
     wrong in the real world.
+
+    Hypothesis generation and scoring are vectorized over all candidate pairs
+    at once (previously a pure-Python loop, the dominant cost of a sweep at
+    thousands of frames per point) rather than iterating hypotheses one at a
+    time. Numerically and in tie-breaking this is pinned equivalent to that
+    original loop by ``tests/test_localization_ransac.py``: the loop kept the
+    *first* hypothesis reaching the best ``(inlier_count, -residual_sum)``
+    tuple under strict ``>``, which the two-step ``argmax``/``argmin`` below
+    reproduces exactly, since both return the first occurrence of their
+    extreme value on ties.
     """
     if len(source_centers) < 2:
         return None
     source = source_centers.detach().float()
     target = ego_centers.detach().float()
-    pairs = list(combinations(range(len(source)), 2))[:max_hypotheses]
-    best = None
-    for first, second in pairs:
-        if torch.linalg.vector_norm(source[second] - source[first]) < 0.25:
-            continue
-        rotation, translation = _se2_from_two_pairs(
-            source[[first, second]], target[[first, second]]
-        )
-        residual = torch.linalg.vector_norm(
-            source @ rotation.T + translation - target, dim=-1
-        )
-        inliers = residual <= inlier_threshold
-        candidate = (int(inliers.sum()), -float(residual[inliers].sum()))
-        if best is None or candidate > best[0]:
-            best = candidate, rotation, translation, inliers
-    if best is None or best[0][0] < 2:
+    n = len(source)
+
+    pair_index = torch.combinations(torch.arange(n, device=source.device), r=2)
+    pair_index = pair_index[:max_hypotheses]
+    first_index, second_index = pair_index[:, 0], pair_index[:, 1]
+
+    source_first, source_second = source[first_index], source[second_index]
+    target_first, target_second = target[first_index], target[second_index]
+
+    valid = (
+        torch.linalg.vector_norm(source_second - source_first, dim=-1) >= 0.25
+    )
+
+    rotation, translation = _batched_se2_from_pairs(
+        source_first, source_second, target_first, target_second
+    )
+    # (H, N, 2): every hypothesis's correction applied to every source point.
+    transformed = (
+        torch.einsum("hij,nj->hni", rotation, source) + translation.unsqueeze(1)
+    )
+    residual = torch.linalg.vector_norm(transformed - target.unsqueeze(0), dim=-1)
+    inlier_mask = residual <= inlier_threshold
+    inlier_count = inlier_mask.sum(dim=-1)
+    inlier_residual_sum = (residual * inlier_mask).sum(dim=-1)
+
+    # Invalidate near-duplicate-point hypotheses by giving them a count no
+    # real hypothesis can reach, so they never win the argmax below.
+    inlier_count = torch.where(valid, inlier_count, torch.full_like(inlier_count, -1))
+
+    best_count = inlier_count.max()
+    if best_count.item() < 0:
         return None
-    _, rotation, translation, inliers = best
+    tied = inlier_count == best_count
+    tie_break = torch.where(
+        tied, inlier_residual_sum, torch.full_like(inlier_residual_sum, float("inf"))
+    )
+    best_index = int(torch.argmin(tie_break))
+
+    if int(best_count) < 2:
+        return None
+    rotation = rotation[best_index]
+    translation = translation[best_index]
+    inliers = inlier_mask[best_index]
     rotation, translation = _refine_se2(source[inliers], target[inliers])
     residual = torch.linalg.vector_norm(
         source @ rotation.T + translation - target, dim=-1

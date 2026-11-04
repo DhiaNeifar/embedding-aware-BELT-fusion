@@ -1,0 +1,62 @@
+\section{Method}
+\label{sec:method}
+
+\begin{figure*}[t]
+  \centering
+  \input{figures/method}
+  \caption{\textbf{\paper.} The message is the detected boxes. The receiver proposes an $\SE$ correction from a learned soft association, verifies it with an exact fit over the correspondences the proposal implies, and abstains when the two disagree without enough hard evidence. Every stage runs on the 7-float boxes \freealign sends; nothing is added to the message.}
+  \label{fig:method}
+\end{figure*}
+
+\subsection{Overview}
+\label{sec:problem}
+\paper estimates the correction $T$ of Sec.~\ref{sec:system} from $\mathcal{P}$ and $\mathcal{Q}$ alone, applies it to the CAV boxes, and hands the corrected set to an unchanged late-fusion stage (per-class NMS over the union). A learned soft association over the box tokens proposes a closed-form pose. An exact re-solve over the correspondences the proposal implies verifies it. A statistical test of the proposal against its own covariance, together with an agreement rule between the two fits, decides whether to abstain. Every design decision below is judged by fused AP, not by pose error; Sec.~\ref{sec:protocol} shows why that distinction is not academic.
+
+\subsection{Propose: learned soft association and closed-form pose}
+\label{sec:propose}
+\paragraph{Tokens and trunk.}
+Each object becomes one token, $\mathrm{MLP}([x,y,z,l,w,h,\cos\psi,\sin\psi,s])$ plus a learned set-membership embedding (ego or CAV). A four-layer transformer ($d=256$, four heads) runs self-attention within each set and cross-attention between them. Object counts are 20 to 60, so this costs nothing measurable. The box carries geometry; nothing else is transmitted (Sec.~\ref{sec:appearance} explains why there is no appearance embedding).
+
+\paragraph{Sinkhorn assignment.}
+Trunk outputs are projected to match features, a score matrix $S\in\R^{M\times N}$ is augmented with a dustbin row and column for objects without a counterpart, and 20 Sinkhorn iterations~\cite{cuturi2013sinkhorn} give a soft assignment $P$ with row and column sums bounded by one. For every ego object we form its match mass $w_i=\sum_j P_{ij}$ and virtual counterpart $\hat{\mathbf{q}}_i=\sum_j P_{ij}\mathbf{q}_j/w_i$, with a virtual heading from the mass-weighted heading directions.
+
+\paragraph{Heading-augmented weighted Kabsch.}
+Headings enter the same least-squares problem as centres: each object contributes a second virtual point at $\mathbf{p}_i+\lambda\,\mathbf{u}(\psi_i)$ with $\lambda=\SI{2}{m}$, about half a vehicle length, and likewise for $\hat{\mathbf{q}}_i$. Over the augmented, weighted point sets the $\SE$ fit is closed form,
+\begin{equation}
+\theta=\operatorname{atan2}\!\Big(\textstyle\sum_n w_n\,(\mathbf{q}'_n\!\times\!\mathbf{p}'_n),\ \sum_n w_n\,(\mathbf{q}'_n\!\cdot\!\mathbf{p}'_n)\Big),\quad
+\mathbf{t}=\bar{\mathbf{p}}-R(\theta)\bar{\mathbf{q}},
+\label{eq:kabsch}
+\end{equation}
+where primes denote centred points and the sums run over the $2M$ augmented points~\cite{kabsch1976solution}. Yaw is never regressed, which is the structural answer to the yaw collapse that pose-regression heads show on this data (Sec.~\ref{sec:ablation}). Because every matched object contributes a centre and a heading, a single correspondence already determines $\SE$; this is what lets \paper answer pairs sharing one object, where a centre-only or distance-graph method is degenerate.
+
+\paragraph{Inverse-variance weights.}
+Least squares is only maximum likelihood when every observation carries the same variance, and here it does not: measured under the \emph{true} pose on held-out data, so that what is measured is detector disagreement and never pose error, the cross-agent centre residual of the same object is \SI{0.53}{m} RMS at the lowest confidence decile and \SI{0.21}{m} at the highest, and the heading residual \ang{13.6} against \ang{3.2}. We fit a two-parameter power law in the pair's minimum score for centre and for heading variance and multiply each correspondence's Sinkhorn mass by the resulting precision. The same model supplies the covariance the abstention test needs (Sec.~\ref{sec:abstain}), so nothing there is fitted twice.
+
+\paragraph{Robust re-weighting.}
+Least squares has no redescending influence function: a wrong correspondence with small but non-zero mass biases the fit in proportion to its residual and nothing removes it. Two Huber IRLS~\cite{huber1964robust} steps around Eq.~\eqref{eq:kabsch} ($c=1.345$ on the residual scaled by its predicted standard deviation) down-weight them. The pair falls back to the proposal when the re-weighted evidence drops below three effective objects.
+
+\paragraph{Training.}
+Stage~1 trains trunk and match head on the negative log-likelihood of the ground-truth assignment under $P$, dustbins included, with pose noise $\sigma\in[0,\SI{0.5}{m}]$. Stage~2 trains the pose head under a noise curriculum from 0 to \SI{2}{m} on a corner loss: the predicted and the true correction are applied to the CAV boxes and the $L_1$ distance over the four BEV corners is taken, which is in metres throughout, weights heading error by object size automatically and optimises what IoU measures. Ground-truth correspondences come from the datasets' object identities and are used only as supervision; at inference nothing but the boxes is read.
+
+\subsection{Verify: an exact re-solve over the proposed correspondences}
+\label{sec:verify}
+The proposal's input to Eq.~\eqref{eq:kabsch} is one virtual point per ego object, a mixture of candidates. As pose noise grows the Sinkhorn row spreads over neighbours and the mixture lands between them, so the answer is blurred rather than wrong (Fig.~\ref{fig:residuals}). A hard fit does not blur, and \freealign's advantage on dense pairs is exactly that it decides the correspondence and then fits exactly. We give the proposal the same second step. Starting from $(\theta,\mathbf{t})$, we move the CAV boxes, take the mutually-nearest ego/CAV centre pairs within a gate, fit $\SE$ over them, and repeat with the gate shrinking through $6, 3, 1.5, 0.75, \SI{0.5}{m}$; the schedule's first gate is wide because the proposal can be metres off on the pairs that matter most, and the later gates are what makes the final fit precise. At each stage the fit is not least squares but a two-point RANSAC~\cite{fischler1981ransac} in $\SE$: every pair of correspondences (exhaustively up to 16 pairs, 512 fixed draws beyond) proposes a transform, the transform with the largest consensus at \SI{1}{m} wins, and the heading-augmented exact fit over its inliers is the stage's answer. The number of inliers of the final stage is the fit's \emph{consensus} $c$, which Sec.~\ref{sec:abstain} uses. The step engages when the first gate finds at least three pairs; otherwise the proposal stands. Nothing is learned here and no byte is added.
+
+\subsection{Abstain: a calibrated decision to correct}
+\label{sec:abstain}
+At low pose error the right action is often no correction, and an estimator that always corrects damages the clean case. Two rules decide, in sequence.
+
+\paragraph{Wald test on the proposal.}
+With $A=\sum_n w_n J_n^{\!\top}J_n$ the weighted normal matrix of the solve and $B$ the corresponding sandwich term under the fitted noise model, in which the two augmented points of one object share their centre error (correlation 0.84 at our constants, so treating them as independent would understate the covariance by a factor that is worst exactly where the evidence is thinnest), the covariance of the proposed correction $\hat\vartheta=(\theta,\mathbf{t})$ is $A^{-1}BA^{-1}$ and
+\begin{equation}
+T^2=\hat\vartheta^{\!\top}\!\big(A^{-1}BA^{-1}\big)^{-1}\hat\vartheta\,/\,\hat\tau^2
+\label{eq:wald}
+\end{equation}
+tests it against ``no correction is needed''~\cite{wald1943tests}, where $\hat\tau^2$ is the one scale the model does not supply, the ratio of observed to predicted weighted residual for that pair. The pair is corrected when $T^2$ exceeds the $\chi^2_3$ quantile at level $\alpha$; $\alpha=0.2$ is selected on validation AP among $\{0.5,0.2,0.1,0.05,0.01\}$ and a per-pair variant.
+
+\paragraph{Agreement with a consensus floor.}
+The verified fit replaces the proposal when the two agree, $\lVert\mathbf{t}_{\mathrm{exact}}-\mathbf{t}_{\mathrm{prop}}\rVert\le\SI{1}{m}$, \emph{or} when the exact fit rests on a consensus $c\ge 4$ hard pairs. Without the floor the rule throws away precisely the pairs the verification exists for, those where the proposal is metres off but the exact fit rests on a solid consensus; with it, dense-pair coverage at $\sigma=\SI{2}{m}$ rises from 0.84 to 0.93 at an unchanged \SI{0.25}{m} answered error. If neither condition holds and the Wald test fired, the proposal is used; if the test did not fire, the pair is left uncorrected. Tolerance and floor are selected on validation AP among $\{0.5,1.0\}$~m and $\{0,4,6\}$.
+
+\subsection{What is transmitted}
+\label{sec:bytes}
+Each agent sends its detected boxes, seven floats and a score, plus its pose: 218 bytes per agent-frame on \vxreal and 439 on \opvv at observed object counts, identical to \freealign. No embedding, feature map or codebook is involved. Earlier versions of this work transmitted a 128-d per-object embedding (8,034 of 8,474 bytes per agent-frame); Sec.~\ref{sec:appearance} reports why it was removed.

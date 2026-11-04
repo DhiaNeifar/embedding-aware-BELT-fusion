@@ -1,0 +1,35 @@
+%% The one-page contract of the paper. Not part of the final paper.
+\section*{Read first: the paper at a glance}
+
+\noindent\textbf{Thesis.} Every cooperative pipeline, late or intermediate, places a CAV's data through one CAV-to-ego transform. AlignFormer corrects that transform from detected boxes and each vehicle's own odometry, then hands it to the unchanged host. No host retraining, and no knowledge of the noise. The method is Propose, Verify, Abstain: a transformer over box tokens with Sinkhorn assignment and a closed-form pose proposes, an exact RANSAC fit verifies, and a Wald test on the estimator's own covariance decides whether to correct at all. It then follows each CAV over time and, in late fusion, estimates delay.
+
+\medskip\noindent\textbf{Rules of this paper.}
+\begin{itemize}\setlength\itemsep{1pt}
+  \item[\textbf{R1}] \textbf{No noise knowledge.} The plug-in never receives the noise level, its distribution, the delay, or any ground truth. Only the simulator that corrupts the poses knows them. A result obtained any other way is not reported.
+  \item[\textbf{R2}] \textbf{Paper equals code.} Every method paragraph names the code that does it. Every number names its run. A claim without a run is not written.
+  \item[\textbf{R3}] \textbf{One configuration.} Hyper-parameters are chosen once on V2X-Real validation, then frozen for all datasets, hosts and conditions.
+  \item[\textbf{R4}] \textbf{One protocol.} Same frames, ego, ground-truth window, noise draws and evaluator for every method on a dataset.
+  \item[\textbf{R5}] \textbf{Only necessary runs.} Every run feeds one exhibit below. No exhibit, no run.
+  \item[\textbf{R6}] \textbf{Stages must earn their place.} A stage that does not help in the ablation is removed from the method and the code.
+\end{itemize}
+
+\medskip\noindent\textbf{How to read the outline.} Each \textcolor{outlineblue}{\textbf{\P n}} is one paragraph of the final paper, with its highlights. \textcolor{outlinegreen}{\footnotesize[code]} is code that exists today, \textcolor{outlineorange}{\footnotesize[to build]} is code to write first, and \textcolor{red!70!black}{\footnotesize\textbf{[C$n$]}} is the claim it carries. \textcolor{outlineteal}{Teal text} under an exhibit says why it exists and what we conclude from it. Tables are empty shells: their rows and columns are what the experiments must produce. The ledger at the end maps each exhibit to its run.
+
+\begin{table*}[t]
+  \centering\small
+  \raggedright\textbf{The six claims.} The experiments exist only to test these. ``Publishable if'' is fixed now, before any number is seen; ``if not'' says what the paper then says instead.\par\medskip\centering
+  \begin{tabular}{@{}l p{5.6cm} l p{4.6cm} p{4.0cm}@{}}
+    \toprule
+    & Claim & Exhibits & Publishable if & If not \\
+    \midrule
+    \textbf{C1} & \textbf{It is the better plug-in for intermediate fusion.} On the same unchanged hosts and noise draws, it recovers more AP than FreeAlign and does not damage the clean case. \emph{Headline, and the go/no-go.} & T1, F3, F4 & At $\sigma\geq 0.4$: above FreeAlign on most hosts with paired significance, and at least 90\% of perfect-pose AP on OPV2V and V2X-Real at $\sigma=1$. At $\sigma=0$: within 0.02 of perfect pose. & If level with FreeAlign, the headline moves to late fusion and the clean case (C3), and T1 is reported as parity. \\
+    \textbf{C2} & \textbf{It can replace a network's built-in correction.} Same weights, only the corrector changes: CoAlign's pose graph, RoCo's matching. & T2 & At or above the built-in correction at $\sigma\geq 0.4$. & Claim ``competitive, and no network-specific stage''. \\
+    \textbf{C3} & \textbf{It beats FreeAlign in late fusion} at every $\sigma$ on OPV2V and V2X-Real, with Propose, Verify, Abstain alone (one frame) and over time. & T3, T4 & Paired difference positive in every cell over 20 seeds, at AP$_{0.7}$ and AP$_{0.5}$. & Name the cells where it does not. \\
+    \textbf{C4} & \textbf{It uses the reported pose safely, with no noise knowledge.} FreeAlign needs none either, because it does not use that pose. Ours does, so a bad report must not hurt it. The frozen configuration holds under noise it never saw. & T5 & Above FreeAlign in every row. The out-of-training-range row may fail if Abstain contains the damage. & State the limit as a limitation. \\
+    \textbf{C5} & \textbf{It handles unknown delay in late fusion.} Pose and latency are recovered from boxes, and zero delay is unharmed. & T6, F5 & Above both FreeAlign rows at 100--400\,ms, and at most 0.005 below the no-delay-stage result at 0\,ms. & Drop the stage (R6) or restrict the claim to where it holds. \\
+    \textbf{C6} & \textbf{Each stage earns its place, and the cost is negligible.} & T7 & Each stage helps on at least one dataset and hurts on neither. Message below 0.01\% of a host's. & Remove the stage (R6). \\
+    \bottomrule
+  \end{tabular}
+\end{table*}
+
+\clearpage

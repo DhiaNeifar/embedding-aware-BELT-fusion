@@ -1,0 +1,43 @@
+%% Packages and macros for the AlignFormer draft. Loaded before hyperref.
+
+\usepackage{graphicx}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{xspace}
+\usepackage{xcolor}
+\usepackage{siunitx}
+\usepackage{tikz}
+\usetikzlibrary{fit,positioning,arrows.meta,backgrounds}
+\sisetup{detect-all}
+
+%% Inline annotations. Disable for submission by uncommenting the two lines below the definitions.
+\newcommand{\red}[1]{{\color{red}#1}}
+\newcommand{\todo}[1]{{\color{red}#1}}
+\newcommand{\TODO}[1]{\textbf{\color{red}[TODO: #1]}}
+% \renewcommand{\TODO}[1]{}
+% \renewcommand{\todo}[1]{#1}
+
+%% Placeholder for a figure that is not drawn yet: \placeholderfig{<width>}{<height>}{<what will go here>}
+\newcommand{\placeholderfig}[3]{%
+  \fbox{\begin{minipage}[c][#2][c]{\dimexpr#1-2\fboxsep-2\fboxrule\relax}\centering\small\color{red}#3\end{minipage}}}
+
+%% Names
+\newcommand{\paper}{AlignFormer\xspace}
+\newcommand{\freealign}{FreeAlign\xspace}
+\newcommand{\vxreal}{V2X-Real\xspace}
+\newcommand{\opvv}{OPV2V\xspace}
+
+%% Math
+\DeclareMathOperator*{\argmin}{arg\,min}
+\DeclareMathOperator*{\argmax}{arg\,max}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\SE}{\mathrm{SE}(2)}
+\newcommand{\ap}[1]{AP$_{#1}$}
+
+%% Tables: a pending number
+\newcommand{\pending}{{\color{red}--}}
+\newcommand{\best}[1]{\textbf{#1}}
+
+%% work harder in optimizing text layout; enable at the very end
+% \usepackage{microtype}

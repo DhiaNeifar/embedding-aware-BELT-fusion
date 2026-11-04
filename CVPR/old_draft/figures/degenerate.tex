@@ -1,0 +1,41 @@
+% Fig: why shared-object count matters differently for a relative-distance graph vs a single heading-aware match.
+\begin{tikzpicture}[
+  >=Latex, scale=0.78, every node/.style={transform shape},
+  pt/.style={circle, fill=black!70, inner sep=1.1pt},
+  panel/.style={draw=black!30, rounded corners=3pt, inner sep=8pt},
+]
+  % --- left panel: FreeAlign, 2 shared objects, relative-distance graph ---
+  \begin{scope}
+    \node[pt] (a1) at (0,1.9) {};
+    \node[pt] (a2) at (1.6,1.1) {};
+    \draw[line width=0.7pt, black!60] (a1) -- (a2) node[midway, above, font=\scriptsize] {$d_{12}$};
+    % two alternate rotated placements consistent with the same single distance
+    \draw[orange!70!black, line width=0.8pt, dashed] (0.35,0.55) -- (1.95,1.25);
+    \draw[orange!70!black, line width=0.8pt, dashed] (0.1,0.2) -- (1.2,1.85);
+    \node[orange!70!black, font=\scriptsize] at (1.05,0.0) {2 rotations fit $d_{12}$};
+    \node[font=\scriptsize\bfseries, red!70!black] at (0.8,-0.55) {ambiguous rotation};
+    \node[font=\scriptsize] at (0.8,2.55) {\freealign: 2 shared objects};
+  \end{scope}
+
+  % --- middle panel: FreeAlign, 3 shared objects, rigid graph ---
+  \begin{scope}[xshift=4.0cm]
+    \node[pt] (b1) at (0,1.9) {};
+    \node[pt] (b2) at (1.6,1.1) {};
+    \node[pt] (b3) at (0.6,0.1) {};
+    \draw[line width=0.7pt, black!60] (b1) -- (b2);
+    \draw[line width=0.7pt, black!60] (b2) -- (b3);
+    \draw[line width=0.7pt, black!60] (b3) -- (b1);
+    \node[font=\scriptsize\bfseries, green!40!black] at (0.8,-0.55) {pose determined};
+    \node[font=\scriptsize] at (0.8,2.55) {\freealign: 3+ shared objects};
+  \end{scope}
+
+  % --- right panel: AlignFormer, 1 shared object with heading ---
+  \begin{scope}[xshift=8.3cm]
+    \node[pt] (c1) at (0.8,1.1) {};
+    \draw[->, line width=1.1pt, cvprblue!70!black] (c1) -- ++(0,0.55) node[above, font=\scriptsize, text=black] {heading};
+    \node[font=\scriptsize\bfseries, green!40!black] at (0.8,-0.55) {$\SE$ determined};
+    \node[font=\scriptsize] at (0.8,2.55) {\paper: 1 shared object};
+  \end{scope}
+
+  \foreach \x in {0,4.0,8.3} \node[panel, fit={(\x-0.9,-0.9) (\x+2.5,2.9)}] {};
+\end{tikzpicture}

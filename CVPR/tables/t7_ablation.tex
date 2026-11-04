@@ -1,0 +1,15 @@
+%% T7: one stage added per row, and its cost. Derived from the T3 and T6 runs, plus scripts/measure_cost.py
+\newcommand{\ablrow}[1]{#1 & \pending & \pending & \pending & \pending \\}
+\begin{table}[t]
+  \centering\footnotesize
+  \caption{\textbf{T7: what each stage adds.} Late fusion, AP$_{0.7}$ at $\sigma=1$ (delay stages: at 200\,ms). Bytes per agent-frame added by the stage, runtime per frame.}
+  \setlength{\tabcolsep}{3.5pt}
+  \begin{tabular}{@{}lcccc@{}}
+    \toprule
+    Stage added & OPV2V & V2X-Real & bytes & ms \\
+    \midrule
+    \ablrow{Propose}\ablrow{+ Verify}\ablrow{+ Abstain (Wald, agreement)}\ablrow{+ pooling over time}\ablrow{+ Abstain over time}\ablrow{+ latency estimate}\ablrow{+ staleness scores}
+    \bottomrule
+  \end{tabular}
+  \why{\textbf{Why this table:} it justifies the method's complexity, and it decides what stays in it. \textbf{How to read it.} Each row adds one stage to the row above. The difference between rows is what that stage is worth. Bytes and ms are what it costs. \textbf{What we conclude.} Which stages earn their place. A stage that does not help is removed from the method and the code (R6). The cost columns, against a host's message size, show whether the plug-in is practical to deploy.}
+\end{table}

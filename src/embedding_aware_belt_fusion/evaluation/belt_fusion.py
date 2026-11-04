@@ -5,8 +5,10 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import math
 from collections import OrderedDict
 from pathlib import Path
+from typing import Tuple
 
 import torch
 from torch.utils.data import DataLoader, Subset
@@ -28,6 +30,42 @@ from embedding_aware_belt_fusion.integration.localization import (
     apply_se2_correction,
     correspondences_by_source,
     estimate_se2_ransac,
+)
+from embedding_aware_belt_fusion.alignformer_pva.abstain import AbstentionConfig
+from embedding_aware_belt_fusion.alignformer_pva.refine import (
+    AgreementConfig,
+    DEFAULT_GATES_M as PVA_DEFAULT_GATES_M,
+    DEFAULT_INLIER_M as PVA_DEFAULT_INLIER_M,
+    DEFAULT_MIN_PAIRS as PVA_DEFAULT_MIN_PAIRS,
+    ICP_RANSAC as PVA_ICP_RANSAC,
+    REFINE_MODES as PVA_REFINE_MODES,
+    RefineConfig,
+)
+from embedding_aware_belt_fusion.alignformer_pva.train import (
+    load_alignformer_pva,
+    load_embedding_encoder,
+)
+from embedding_aware_belt_fusion.alignformer_pva.inference import (
+    correct_simple_detections,
+    fuse_corrected_simple_detections,
+)
+from embedding_aware_belt_fusion.alignformer_pva.robust import RobustSolveConfig
+from embedding_aware_belt_fusion.alignformer_pva.shrinkage import ShrinkageCalibration
+from embedding_aware_belt_fusion.freealign.freealign import (
+    DEFAULT_MIN_NODES as FREEALIGN_DEFAULT_MIN_NODES,
+    EDGE_DISTANCE as FREEALIGN_EDGE_DISTANCE,
+    EDGE_DISTANCE_YAW as FREEALIGN_EDGE_DISTANCE_YAW,
+)
+from embedding_aware_belt_fusion.freealign.freealign_calibration import (
+    freealign_config_from_args,
+)
+from embedding_aware_belt_fusion.freealign.inference import (
+    DEFAULT_ASSOCIATION_DISTANCE_M as FREEALIGN_DEFAULT_ASSOCIATION_DISTANCE_M,
+    correct_simple_detections as freealign_correct_simple_detections,
+    fuse_corrected_simple_detections as freealign_fuse_corrected_simple_detections,
+)
+from embedding_aware_belt_fusion.data.materialize_context_roi_cache import (
+    padded_roi_cell_indices_and_flags,
 )
 from embedding_aware_belt_fusion.communication.product_codebook import (
     load_product_codebook,
@@ -286,7 +324,258 @@ def parse_args() -> argparse.Namespace:
             "grouping and fusion. Requires --oracle-grouping."
         ),
     )
+    parser.add_argument(
+        "--alignformer-pva-checkpoint",
+        type=Path,
+        help=(
+            "Opt-in, additive alternative to --ransac-localization-correction: "
+            "a trained AlignFormer Propose-Verify-Abstain checkpoint "
+            "(embedding_aware_belt_fusion.alignformer_pva). Geometry-only "
+            "(no PQ-STF/TrackFormer embeddings): per source CAV, solves a "
+            "Sinkhorn/Kabsch pose correction from simple_detections_by_cav "
+            "box geometry alone, hardens it with a RANSAC Verify re-solve, "
+            "and gates it with a Wald-test Abstain decision, before applying "
+            "it with the same apply_se2_correction mechanism the RANSAC path "
+            "uses. Produces its own 'alignformer_pva' row; it does not alter "
+            "any existing flag's behavior when omitted."
+        ),
+    )
+    parser.add_argument(
+        "--alignformer-pva-refine-mode",
+        choices=PVA_REFINE_MODES,
+        default=PVA_ICP_RANSAC,
+        help=(
+            "Verify-stage hardening of the soft Sinkhorn/Kabsch solve "
+            "(alignformer_pva.refine.icp_refine): 'none' keeps the soft "
+            "estimate, 'icp' re-solves exactly over mutually-nearest hard "
+            "pairs, 'icp_ransac' (default) additionally takes a RANSAC "
+            "consensus over those hard pairs."
+        ),
+    )
+    parser.add_argument(
+        "--alignformer-pva-refine-min-pairs",
+        type=int,
+        default=PVA_DEFAULT_MIN_PAIRS,
+        help="Minimum hard correspondences before the Verify re-solve engages.",
+    )
+    parser.add_argument(
+        "--alignformer-pva-refine-inlier-m",
+        type=float,
+        default=PVA_DEFAULT_INLIER_M,
+        help="RANSAC inlier gate (metres) for the Verify stage's hard-pair fit.",
+    )
+    parser.add_argument(
+        "--alignformer-pva-refine-gates-m",
+        type=str,
+        default=",".join(str(gate) for gate in PVA_DEFAULT_GATES_M),
+        help=(
+            "Comma-separated Verify-stage gate schedule in metres, widest "
+            f"first (default {','.join(str(gate) for gate in PVA_DEFAULT_GATES_M)}"
+            ", matching alignformer_pva.refine.DEFAULT_GATES_M). Chenyi's own "
+            "tuned schedule is '6,3,1.5,0.75,0.5' -- wider because, per his "
+            "own paper, 'the proposal can be metres off on the pairs that "
+            "matter most'."
+        ),
+    )
+    parser.add_argument(
+        "--alignformer-pva-abstain-level",
+        type=float,
+        default=0.05,
+        help=(
+            "False-fire level of the Abstain stage's Wald test "
+            "(alignformer_pva.abstain.decide, mode='abstain'): a source "
+            "CAV's correction is zeroed unless its own Wald statistic clears "
+            "this level's threshold. The geometry-only analogue of "
+            "--ransac-min-inliers/--ransac-min-relative-improvement. 0 "
+            "disables the gate (always apply the Verify-stage correction)."
+        ),
+    )
+    parser.add_argument(
+        "--alignformer-pva-agreement-tolerance-m",
+        type=float,
+        default=None,
+        help=(
+            "Opt-in second Abstain-stage rule (alignformer_pva.refine.agree), "
+            "Chenyi's 'agreement with a consensus floor': when given, the "
+            "Verify-stage exact fit replaces the Wald-gated proposal only "
+            "where the two agree within this many metres of each other (or "
+            "the exact fit's own hard-pair consensus clears "
+            "--alignformer-pva-consensus-floor); otherwise the Wald-gated "
+            "proposal is used. Omitted (default, every existing invocation) "
+            "skips this rule entirely and reproduces today's simpler "
+            "behavior bit for bit: the Wald test alone gates the Verify-stage "
+            "correction."
+        ),
+    )
+    parser.add_argument(
+        "--alignformer-pva-consensus-floor",
+        type=int,
+        default=0,
+        help=(
+            "Hard-pair consensus (alignformer_pva.refine.AgreementConfig."
+            "consensus_floor) above which the agreement rule accepts the "
+            "exact fit even when it disagrees with the proposal by more than "
+            "--alignformer-pva-agreement-tolerance-m. 0 disables the floor "
+            "(default, matching AgreementConfig's own default). Only takes "
+            "effect when --alignformer-pva-agreement-tolerance-m is given."
+        ),
+    )
+    parser.add_argument(
+        "--alignformer-pva-association-distance",
+        type=float,
+        default=5.0,
+        help=(
+            "Geometric gate for associating corrected simple detections "
+            "across agents before score-weighted fusion of the "
+            "'alignformer_pva' row."
+        ),
+    )
+    parser.add_argument(
+        "--alignformer-pva-context-margin-m",
+        type=float,
+        default=1.75,
+        help=(
+            "Context-padding margin (metres) for live per-object embedding "
+            "cells, ONLY used when --alignformer-pva-checkpoint was trained "
+            "with --embed-dim > 0 (data/materialize_context_roi_cache.py's "
+            "training-time cache uses the same convention). Ignored for a "
+            "geometry-only (embed_dim=0) checkpoint. Should match the margin "
+            "the checkpoint's embedding encoder was actually trained with, "
+            "or the live embedding distribution will not match training."
+        ),
+    )
+    parser.add_argument(
+        "--alignformer-pva-robust-mode",
+        choices=("none", "huber"),
+        default="none",
+        help=(
+            "Optional IRLS re-weighting of the Propose stage's weighted "
+            "Kabsch solve (alignformer_pva.robust.RobustSolveConfig), run "
+            "before Verify/Abstain. 'none' (default) reproduces the "
+            "original single weighted-Kabsch solve exactly. 'huber' "
+            "matches Chenyi's own robust_solve_config (iterations=2, "
+            "huber_constant=1.345, scale_floor_m=0.05, min_evidence=3.0; "
+            "override iterations with --alignformer-pva-robust-iterations)."
+        ),
+    )
+    parser.add_argument(
+        "--alignformer-pva-robust-iterations",
+        type=int,
+        default=2,
+        help="IRLS re-weight/re-solve rounds when --alignformer-pva-robust-mode huber.",
+    )
+    parser.add_argument(
+        "--alignformer-pva-shrinkage-tau-translation-m",
+        type=float,
+        default=None,
+        help=(
+            "Opt-in James-Stein-style shrinkage of the Propose-stage "
+            "estimate toward the identity (alignformer_pva.shrinkage), "
+            "applied BEFORE Verify/Abstain. Requires both this and "
+            "--alignformer-pva-shrinkage-tau-yaw-deg. Omitted (default) "
+            "skips shrinkage entirely, reproducing existing behavior; "
+            "mutually exclusive in spirit with Abstain's per-pair decision "
+            "(Chenyi's own protocol uses one or the other, not both, as "
+            "alternative treatments of the same base estimate)."
+        ),
+    )
+    parser.add_argument(
+        "--alignformer-pva-shrinkage-tau-yaw-deg",
+        type=float,
+        default=None,
+        help="Paired with --alignformer-pva-shrinkage-tau-translation-m; see its help.",
+    )
+    parser.add_argument(
+        "--freealign",
+        action="store_true",
+        help=(
+            "Opt-in, additive competitor row: Lei et al.'s FreeAlign (ICRA "
+            "2024), REIMPLEMENTED on our own detections "
+            "(embedding_aware_belt_fusion.freealign). Training-free: per "
+            "source CAV, builds each side's salient-object distance graph "
+            "from simple_detections_by_cav box geometry alone, finds the "
+            "common subgraph by MASS, and fits a robust (RANSAC/LMedS) "
+            "SE(2) correction over it, applied with the same "
+            "apply_se2_correction mechanism every other alignment method "
+            "uses. Produces its own 'freealign' row; it does not alter any "
+            "existing flag's behavior when omitted."
+        ),
+    )
+    parser.add_argument(
+        "--freealign-calibration",
+        type=Path,
+        default=None,
+        help=(
+            "Path to a freealign/calibrate_freealign.py result JSON; its "
+            "'selected' block sets EVERY FreeAlignConfig field (the edge "
+            "threshold, anchor limit, epsilon power/offset and robust "
+            "estimator this project calibrated on our own scenario-disjoint "
+            "validation role -- never the labmate's own fitted numbers). "
+            "Requires --freealign. Mutually exclusive with "
+            "--freealign-edge-feature/--freealign-min-nodes (a calibration "
+            "file already sets those two)."
+        ),
+    )
+    parser.add_argument(
+        "--freealign-edge-feature",
+        choices=(FREEALIGN_EDGE_DISTANCE, FREEALIGN_EDGE_DISTANCE_YAW),
+        default=FREEALIGN_EDGE_DISTANCE,
+        help=(
+            "FreeAlign's salient-object edge feature absent --freealign-"
+            "calibration: 'distance' (default, the paper's training-free "
+            "path and their shipped gnn:false config) or 'distance_yaw' "
+            "(their shipped greedy_match.py's 2-channel edge)."
+        ),
+    )
+    parser.add_argument(
+        "--freealign-min-nodes",
+        type=int,
+        default=FREEALIGN_DEFAULT_MIN_NODES,
+        help=(
+            "FreeAlign's abstain threshold absent --freealign-calibration: "
+            "below this many matched objects the collaborative message is "
+            "discarded (fused uncorrected), mirroring alignformer_pva's own "
+            "MIN_MATCH_MASS fallback."
+        ),
+    )
+    parser.add_argument(
+        "--freealign-association-distance",
+        type=float,
+        default=FREEALIGN_DEFAULT_ASSOCIATION_DISTANCE_M,
+        help=(
+            "Geometric gate for associating corrected simple detections "
+            "across agents before score-weighted fusion of the "
+            "'freealign' row."
+        ),
+    )
     parser.add_argument("--global-sort-detections", action="store_true")
+    parser.add_argument(
+        "--skip-belt",
+        action="store_true",
+        help=(
+            "Skip BELT's uncertainty-weighted association/fusion entirely "
+            "(no belt_geometry/belt_association in the output). Additive, "
+            "off by default so existing behavior is unchanged; use this when "
+            "BELT's numbers aren't needed, since its association step is a "
+            "real per-frame cost."
+        ),
+    )
+    parser.add_argument(
+        "--fast-ap",
+        action="store_true",
+        help=(
+            "Route NMS, range filtering and TP/FP matching through the "
+            "compiled embedding_aware_belt_fusion.fusion_core extension "
+            "(vendored from GenCPM/OpenCPM, exact double-precision polygon "
+            "IoU, same math as box_utils.nms_rotated + eval_utils."
+            "caluclate_tp_fp) instead of OpenCOOD's shapely path, which "
+            "recomputes per-pair polygon IoU once per IoU threshold. "
+            "Numerically equivalent; only the naive, ego_only, oracle, "
+            "freealign and alignformer_pva rows use it today. Requires "
+            "building fusion_core once (see _load_fusion_core's error "
+            "message for the command)."
+        ),
+    )
     parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
     return parser.parse_args()
 
@@ -517,6 +806,98 @@ def _postprocess_fused_boxes(boxes, scores, postprocessor):
     return corners[in_range], scores[in_range]
 
 
+_FUSION_CORE = None
+
+
+def _load_fusion_core():
+    """Import the compiled embedding_aware_belt_fusion.fusion_core extension.
+
+    Vendored from GenCPM/OpenCPM's tools/fusion_core (same math as
+    opencood.utils.box_utils.nms_rotated + opencood.utils.eval_utils.
+    caluclate_tp_fp, exact double-precision polygon-clip IoU), built once
+    per Python ABI into fusion_core/build next to this package.
+    """
+    global _FUSION_CORE
+    if _FUSION_CORE is None:
+        import sys
+
+        build_dir = Path(__file__).resolve().parents[1] / "fusion_core" / "build"
+        if str(build_dir) not in sys.path:
+            sys.path.insert(0, str(build_dir))
+        try:
+            import fusion_core
+        except ImportError as exc:
+            raise ImportError(
+                "fusion_core extension not found or built for a different "
+                "Python ABI. Build it once with:\n"
+                "  cmake -S src/embedding_aware_belt_fusion/fusion_core "
+                "-B src/embedding_aware_belt_fusion/fusion_core/build "
+                f"-DPython_EXECUTABLE={sys.executable}\n"
+                "  cmake --build src/embedding_aware_belt_fusion/fusion_core/build -j"
+            ) from exc
+        _FUSION_CORE = fusion_core
+    return _FUSION_CORE
+
+
+def _evaluate_prediction_fast(boxes, scores, ground_truth, postprocessor, statistics):
+    """fusion_core-backed replacement for _postprocess_fused_boxes +
+    _evaluate_prediction: one compiled NMS + range-filter + greedy TP/FP
+    pass shared across every IoU threshold, instead of OpenCOOD's shapely
+    path recomputing polygon IoUs once per threshold."""
+    import numpy as np
+    from opencood.utils import box_utils, common_utils
+
+    fusion_core = _load_fusion_core()
+    thresholds = sorted(statistics)
+    thresholds_arr = np.asarray(thresholds, dtype=np.float64)
+    gt = np.ascontiguousarray(
+        common_utils.torch_tensor_to_numpy(ground_truth), dtype=np.float32
+    )
+    if boxes is None or len(boxes) == 0:
+        sc = np.zeros(0, dtype=np.float32)
+        tp = np.zeros((len(thresholds), 0), dtype=np.int8)
+    else:
+        if len(boxes.shape) == 2:  # (N, 7) center format -> corners
+            corners = box_utils.boxes_to_corners_3d(
+                boxes, order=postprocessor.params["order"]
+            )
+        else:  # already (N, 8, 3) corners (e.g. OpenCOOD's own post_process)
+            corners = boxes
+        corners = np.ascontiguousarray(
+            common_utils.torch_tensor_to_numpy(corners), dtype=np.float32
+        )
+        sc_in = np.ascontiguousarray(
+            common_utils.torch_tensor_to_numpy(scores), dtype=np.float32
+        )
+        sc, tp = fusion_core.fuse_and_score(
+            corners,
+            sc_in,
+            gt,
+            float(postprocessor.params["nms_thresh"]),
+            thresholds_arr,
+        )
+    for index, threshold in enumerate(thresholds):
+        bucket = statistics[threshold]
+        tp_i = tp[index].astype(int)
+        bucket["tp"] += tp_i.tolist()
+        bucket["fp"] += (1 - tp_i).tolist()
+        bucket["score"] += sc.tolist()
+        bucket["gt"] += int(gt.shape[0])
+
+
+def _postprocess_and_evaluate(
+    boxes, scores, ground_truth, postprocessor, statistics, fast=False
+):
+    """_postprocess_fused_boxes + _evaluate_prediction, or the fusion_core
+    fast path when fast=True. Behaviorally identical to the two-call form
+    when fast=False."""
+    if not fast:
+        boxes, scores = _postprocess_fused_boxes(boxes, scores, postprocessor)
+        _evaluate_prediction(boxes, scores, ground_truth, statistics)
+        return
+    _evaluate_prediction_fast(boxes, scores, ground_truth, postprocessor, statistics)
+
+
 def _set_noise(hypes, args):
     hypes["validate_dir"] = str((args.data_root / args.split).resolve())
     hypes.setdefault("wild_setting", {})
@@ -624,6 +1005,59 @@ def _trackformer_agent(proposal, cav_content, output, hypes):
         "positions": positions,
         "mask": mask,
         "transformation_matrix": cav_content["transformation_matrix"],
+    }
+
+
+def _context_embedding_cells(proposal, output, hypes, *, margin):
+    """Context-padded PointPillars ROI cells for live AlignFormer-PVA embedding inference.
+
+    Phase 1 of the richer-embedding plan. Mirrors ``_trackformer_agent``'s
+    structure exactly (same live ``spatial_features_2d`` source, same
+    relative cell-position convention) but pads each proposal's cell set by
+    ``margin`` metres beyond its exact footprint and tags every cell
+    ``cell_footprint`` (own footprint vs. padding context), using
+    ``data/materialize_context_roi_cache.py``'s own
+    ``padded_roi_cell_indices_and_flags`` so the live and offline-cache paths
+    agree bit-for-bit (both call the identical function).
+
+    Returns ONLY the new ``cell_tokens``/``cell_positions``/``cell_footprint``/
+    ``cell_mask`` keys -- never ``boxes``/``scores``. The caller merges this
+    into an EXISTING ``simple_detections_by_cav[cav_id]`` entry (built by
+    ``_simple_detection``), reusing its ego-frame ``boxes``/``scores`` as-is:
+    that is exactly what ``AlignFormerPVAContextPairDataset``/``train.py`` fed
+    the embedding encoder during training (ego-frame boxes, not the local-frame
+    ones ``_trackformer_agent`` itself keeps for its own, unrelated purpose).
+    """
+    features = output["spatial_features_2d"][0]
+    height, width = features.shape[-2], features.shape[-1]
+    lidar_range = hypes["model"]["args"]["lidar_range"]
+    cells = padded_roi_cell_indices_and_flags(
+        proposal["boxes"], height=height, width=width, lidar_range=lidar_range, margin=margin
+    )
+    count = len(cells)
+    maximum = max((len(indices) for indices, _ in cells), default=0)
+    flattened = features.flatten(1).transpose(0, 1)
+    tokens = features.new_zeros((count, maximum, flattened.shape[-1]))
+    positions = features.new_zeros((count, maximum, 2))
+    footprint = torch.zeros((count, maximum), dtype=torch.bool, device=features.device)
+    mask = torch.ones((count, maximum), dtype=torch.bool, device=features.device)
+    for proposal_index, (indices, flags) in enumerate(cells):
+        indices = indices.to(features.device, dtype=torch.long)
+        length = len(indices)
+        tokens[proposal_index, :length] = flattened[indices]
+        rows = torch.div(indices, width, rounding_mode="floor").float()
+        columns = (indices % width).float()
+        coordinates = torch.stack([rows, columns], dim=-1)
+        coordinates -= coordinates.mean(dim=0, keepdim=True)
+        coordinates /= coordinates.abs().amax(dim=0, keepdim=True).clamp_min(1.0)
+        positions[proposal_index, :length] = coordinates
+        footprint[proposal_index, :length] = flags.to(device=features.device)
+        mask[proposal_index, :length] = False
+    return {
+        "cell_tokens": tokens,
+        "cell_positions": positions,
+        "cell_footprint": footprint,
+        "cell_mask": mask,
     }
 
 
@@ -749,6 +1183,122 @@ def _load_message_codebook(args, trackformer, device):
             "fit a codebook from the model being evaluated."
         )
     return codebook, metadata
+
+
+def parse_alignformer_pva_gates_m(spec: str) -> Tuple[float, ...]:
+    """Parse ``--alignformer-pva-refine-gates-m``'s comma-separated schedule.
+
+    ``"6,3,1.5,0.75,0.5"`` -> ``(6.0, 3.0, 1.5, 0.75, 0.5)``. Raises
+    ``ValueError`` with a message naming the offending spec on anything that
+    is not a non-empty, comma-separated list of finite numbers -- the same
+    construction ``RefineConfig.__post_init__`` itself enforces on the
+    resulting tuple (at least one gate, every gate finite and positive), so a
+    bad CLI value is caught here with a clear message rather than surfacing
+    later as an opaque ``RefineConfig`` error.
+    """
+    pieces = [piece.strip() for piece in str(spec).split(",")]
+    if not pieces or any(piece == "" for piece in pieces):
+        raise ValueError(
+            f"{spec!r} is not a comma-separated gate schedule, e.g. '6,3,1.5,0.75,0.5'"
+        )
+    try:
+        return tuple(float(piece) for piece in pieces)
+    except ValueError as error:
+        raise ValueError(
+            f"{spec!r} is not a comma-separated gate schedule, e.g. '6,3,1.5,0.75,0.5'"
+        ) from error
+
+
+def _load_alignformer_pva(args, device):
+    """Load the opt-in Propose-Verify-Abstain backend, if requested.
+
+    Returns ``(model, checkpoint, refine_config, abstain_config,
+    agreement_config, embedding_encoder)``, all ``None`` when
+    ``--alignformer-pva-checkpoint`` was not given -- the only way this ever
+    changes what ``main`` does for an existing invocation.
+
+    ``refine_config.gates_m`` comes from ``--alignformer-pva-refine-gates-m``
+    (:func:`parse_alignformer_pva_gates_m`), whose default string reproduces
+    ``RefineConfig``'s own ``DEFAULT_GATES_M`` exactly, so an invocation that
+    omits the flag is unaffected.
+
+    ``agreement_config`` is ``None`` unless
+    ``--alignformer-pva-agreement-tolerance-m`` was given -- omitting it
+    skips the agreement rule entirely (see ``inference.estimate_correction``)
+    and reproduces the original Wald-only decision bit for bit.
+
+    ``embedding_encoder`` (Phase 1 of the richer-embedding plan) is loaded
+    additively via ``load_embedding_encoder``: it is ``None`` for every
+    checkpoint trained with ``--embed-dim 0`` (every checkpoint that existed
+    before embeddings were added, and any new one that keeps the default),
+    so passing a geometry-only checkpoint here behaves exactly as before.
+    """
+    if args.alignformer_pva_checkpoint is None:
+        return None, None, None, None, None, None, None, None
+    model, checkpoint = load_alignformer_pva(args.alignformer_pva_checkpoint, device)
+    embedding_encoder = load_embedding_encoder(args.alignformer_pva_checkpoint, device)
+    refine_config = RefineConfig(
+        mode=args.alignformer_pva_refine_mode,
+        gates_m=parse_alignformer_pva_gates_m(args.alignformer_pva_refine_gates_m),
+        min_pairs=args.alignformer_pva_refine_min_pairs,
+        inlier_m=args.alignformer_pva_refine_inlier_m,
+    )
+    abstain_config = (
+        AbstentionConfig(mode="abstain", level=args.alignformer_pva_abstain_level)
+        if args.alignformer_pva_abstain_level > 0.0
+        else AbstentionConfig(mode="none")
+    )
+    agreement_config = (
+        AgreementConfig(
+            tolerance_m=args.alignformer_pva_agreement_tolerance_m,
+            consensus_floor=args.alignformer_pva_consensus_floor,
+        )
+        if args.alignformer_pva_agreement_tolerance_m is not None
+        else None
+    )
+    robust_config = (
+        RobustSolveConfig(
+            mode="huber", iterations=args.alignformer_pva_robust_iterations
+        )
+        if args.alignformer_pva_robust_mode == "huber"
+        else None
+    )
+    shrinkage_config = (
+        ShrinkageCalibration(
+            tau_translation_m=args.alignformer_pva_shrinkage_tau_translation_m,
+            tau_yaw_rad=math.radians(args.alignformer_pva_shrinkage_tau_yaw_deg),
+            pairs=0,
+            split="--alignformer-pva-shrinkage-tau-* (CLI-provided)",
+            sigma_m=0.0,
+        )
+        if args.alignformer_pva_shrinkage_tau_translation_m is not None
+        and args.alignformer_pva_shrinkage_tau_yaw_deg is not None
+        else None
+    )
+    return (
+        model,
+        checkpoint,
+        refine_config,
+        abstain_config,
+        agreement_config,
+        embedding_encoder,
+        robust_config,
+        shrinkage_config,
+    )
+
+
+def _load_freealign(args):
+    """Load the opt-in FreeAlign competitor row's configuration, if requested.
+
+    Returns ``None`` unless ``--freealign`` was given -- the only way this
+    ever changes what ``main`` does for an existing invocation.
+    ``freealign_config_from_args`` (freealign/freealign_calibration.py)
+    itself raises on an inconsistent combination of flags (a calibration
+    file given without ``--freealign``, or alongside a moved
+    ``--freealign-edge-feature``/``--freealign-min-nodes``), so those checks
+    are not duplicated here.
+    """
+    return freealign_config_from_args(args)
 
 
 def _rank_unit_interval(values):
@@ -925,6 +1475,19 @@ def main() -> None:
         raise ValueError(
             "--message-content-ablation requires propagated PQ-STF"
         )
+    if not 0.0 <= args.alignformer_pva_abstain_level <= 1.0:
+        raise ValueError("--alignformer-pva-abstain-level must lie in [0, 1]")
+    if args.alignformer_pva_refine_min_pairs < 1:
+        raise ValueError("--alignformer-pva-refine-min-pairs must be at least 1")
+    parse_alignformer_pva_gates_m(args.alignformer_pva_refine_gates_m)
+    if (
+        args.alignformer_pva_agreement_tolerance_m is not None
+        and args.alignformer_pva_agreement_tolerance_m <= 0.0
+    ):
+        raise ValueError("--alignformer-pva-agreement-tolerance-m must be positive")
+    if args.alignformer_pva_consensus_floor < 0:
+        raise ValueError("--alignformer-pva-consensus-floor must be >= 0")
+    freealign_config = _load_freealign(args)
     device = torch.device(args.device)
 
     from opencood.data_utils.datasets import build_dataset
@@ -969,6 +1532,16 @@ def main() -> None:
     message_codebook, message_metadata = _load_message_codebook(
         args, trackformer, device
     )
+    (
+        alignformer_pva_model,
+        alignformer_pva_checkpoint,
+        alignformer_pva_refine_config,
+        alignformer_pva_abstain_config,
+        alignformer_pva_agreement_config,
+        alignformer_pva_embedding_encoder,
+        alignformer_pva_robust_config,
+        alignformer_pva_shrinkage_config,
+    ) = _load_alignformer_pva(args, device)
     expected_frames = min(
         len(dataset), args.max_frames if args.max_frames is not None else len(dataset)
     )
@@ -999,6 +1572,17 @@ def main() -> None:
         ),
         expected_frames=expected_frames,
     )
+    if alignformer_pva_embedding_encoder is not None and frame_cache.replay:
+        raise ValueError(
+            "--alignformer-pva-checkpoint's embedding encoder (--embed-dim > 0 "
+            "at training time) needs live detector output (spatial_features_2d) "
+            "to compute context-padded cell embeddings matching training. A "
+            "replayed --frame-cache-mode read-only artifact only ever stores "
+            "zero-margin trackformer_agents cell tokens (for the unrelated "
+            "TrackFormer/PQ-STF path), not the dense feature map this needs. "
+            "Rerun with a fresh --frame-cache-dir in read-write mode (or "
+            "without --frame-cache-dir at all) so the live branch runs."
+        )
     loader = None
     if not frame_cache.replay:
         loader = DataLoader(
@@ -1026,6 +1610,18 @@ def main() -> None:
         _statistics() if args.oracle_ransac_localization_correction else None
     )
     embedding_statistics = _statistics() if trackformer is not None else None
+    alignformer_pva_statistics = (
+        _statistics() if alignformer_pva_model is not None else None
+    )
+    alignformer_pva_fused_count = 0
+    alignformer_pva_attempts = alignformer_pva_accepted = 0
+    alignformer_pva_statistic_sum = 0.0
+    alignformer_pva_statistic_count = 0
+    freealign_statistics = _statistics() if freealign_config is not None else None
+    freealign_fused_count = 0
+    freealign_attempts = freealign_accepted = 0
+    freealign_matched_nodes_sum = 0.0
+    freealign_matched_nodes_count = 0
     frame_count = candidate_count = fused_count = matched_groups = 0
     oracle_fused_count = oracle_matched_groups = 0
     oracle_max_score_fused_count = 0
@@ -1143,6 +1739,20 @@ def main() -> None:
                     )
                     simple_detections_by_cav[cav_id]["agent_id"] = cav_id
                     simple_detections_by_cav[cav_id]["oracle_object_ids"] = oracle_ids
+                    if alignformer_pva_embedding_encoder is not None:
+                        # Additive: only runs (and only changes the stored
+                        # artifact's shape) when an embed_dim>0 checkpoint was
+                        # loaded. Every other run -- including a geometry-only
+                        # --alignformer-pva-checkpoint and every run without
+                        # one at all -- never executes this branch, so
+                        # simple_detections_by_cav (and the frame_cache
+                        # artifact built from it below) stay byte-identical.
+                        simple_detections_by_cav[cav_id].update(
+                            _context_embedding_cells(
+                                proposal, outputs[cav_id], hypes,
+                                margin=args.alignformer_pva_context_margin_m,
+                            )
+                        )
                 frame_cache.store(
                     batch_index,
                     {
@@ -1156,55 +1766,136 @@ def main() -> None:
                         "ego_ground_truth": ego_ground_truth,
                     },
                 )
-            _evaluate_prediction(
-                naive_boxes,
-                naive_scores,
-                ground_truth,
-                naive_statistics,
-            )
-            ego_simple_boxes, ego_simple_scores = _postprocess_fused_boxes(
+            if args.fast_ap:
+                _evaluate_prediction_fast(
+                    naive_boxes,
+                    naive_scores,
+                    ground_truth,
+                    opencood_dataset.post_processor,
+                    naive_statistics,
+                )
+            else:
+                _evaluate_prediction(
+                    naive_boxes,
+                    naive_scores,
+                    ground_truth,
+                    naive_statistics,
+                )
+            _postprocess_and_evaluate(
                 simple_detections_by_cav["ego"]["boxes"],
                 simple_detections_by_cav["ego"]["scores"],
-                opencood_dataset.post_processor,
-            )
-            _evaluate_prediction(
-                ego_simple_boxes,
-                ego_simple_scores,
                 ground_truth,
+                opencood_dataset.post_processor,
                 ego_only_statistics,
+                fast=args.fast_ap,
             )
             fused = fuse_detections(
                 detections, maximum_distance=args.association_distance
             )
-            merge_component_counts(
-                belt_association_counts,
-                association_counts(
-                    detections,
-                    fused["groups"],
-                    maximum_distance=args.association_distance,
-                ),
-            )
-            belt_boxes, belt_scores = _postprocess_fused_boxes(
-                fused["boxes"],
-                fused["scores"],
-                opencood_dataset.post_processor,
-            )
-            _evaluate_prediction(
-                belt_boxes, belt_scores, ground_truth, belt_statistics
-            )
-            if args.oracle_grouping:
-                oracle_groups = _oracle_groups(simple_detections_by_cav.values())
-                oracle = fuse_groups_score_weighted(oracle_groups)
-                oracle_boxes, oracle_scores = _postprocess_fused_boxes(
-                    oracle["boxes"],
-                    oracle["scores"],
+            if not args.skip_belt:
+                merge_component_counts(
+                    belt_association_counts,
+                    association_counts(
+                        detections,
+                        fused["groups"],
+                        maximum_distance=args.association_distance,
+                    ),
+                )
+                belt_boxes, belt_scores = _postprocess_fused_boxes(
+                    fused["boxes"],
+                    fused["scores"],
                     opencood_dataset.post_processor,
                 )
                 _evaluate_prediction(
-                    oracle_boxes,
-                    oracle_scores,
+                    belt_boxes, belt_scores, ground_truth, belt_statistics
+                )
+            if alignformer_pva_model is not None:
+                # Propose-Verify-Abstain alternative to
+                # --ransac-localization-correction: geometry-only by default
+                # (operates entirely on simple_detections_by_cav, no
+                # PQ-STF/TrackFormer required, so it runs unconditionally here
+                # rather than inside the trackformer-gated branches below),
+                # or fed a real per-object embedding when
+                # alignformer_pva_embedding_encoder is not None (Phase 1 of
+                # the richer-embedding plan) -- simple_detections_by_cav was
+                # additively augmented with cell_* fields above for exactly
+                # that case.
+                corrected_simple_detections, pva_diagnostics = (
+                    correct_simple_detections(
+                        alignformer_pva_model,
+                        simple_detections_by_cav,
+                        cav_order,
+                        refine_config=alignformer_pva_refine_config,
+                        abstain_config=alignformer_pva_abstain_config,
+                        agreement_config=alignformer_pva_agreement_config,
+                        embedding_encoder=alignformer_pva_embedding_encoder,
+                        robust_config=alignformer_pva_robust_config,
+                        shrinkage_config=alignformer_pva_shrinkage_config,
+                    )
+                )
+                pva_fused = fuse_corrected_simple_detections(
+                    corrected_simple_detections,
+                    cav_order,
+                    maximum_distance=args.alignformer_pva_association_distance,
+                )
+                _postprocess_and_evaluate(
+                    pva_fused["boxes"],
+                    pva_fused["scores"],
                     ground_truth,
+                    opencood_dataset.post_processor,
+                    alignformer_pva_statistics,
+                    fast=args.fast_ap,
+                )
+                alignformer_pva_fused_count += len(pva_fused["boxes"])
+                for pva_stats in pva_diagnostics.values():
+                    alignformer_pva_attempts += int(pva_stats["attempted"])
+                    alignformer_pva_accepted += int(pva_stats["accepted"])
+                    if pva_stats["statistic"] is not None:
+                        alignformer_pva_statistic_sum += pva_stats["statistic"]
+                        alignformer_pva_statistic_count += 1
+            if freealign_config is not None:
+                # Training-free competitor row (embedding_aware_belt_fusion.
+                # freealign): same simple_detections_by_cav input every other
+                # corrected-detections row reads, so the detections, the
+                # noise draws and the fusion step are shared by construction
+                # and only the alignment algorithm differs. Runs
+                # unconditionally here (not gated behind the trackformer
+                # branches below), exactly like the alignformer_pva row.
+                freealign_corrected, freealign_diagnostics = (
+                    freealign_correct_simple_detections(
+                        simple_detections_by_cav, cav_order, freealign_config
+                    )
+                )
+                freealign_fused = freealign_fuse_corrected_simple_detections(
+                    freealign_corrected,
+                    cav_order,
+                    maximum_distance=args.freealign_association_distance,
+                )
+                _postprocess_and_evaluate(
+                    freealign_fused["boxes"],
+                    freealign_fused["scores"],
+                    ground_truth,
+                    opencood_dataset.post_processor,
+                    freealign_statistics,
+                    fast=args.fast_ap,
+                )
+                freealign_fused_count += len(freealign_fused["boxes"])
+                for free_stats in freealign_diagnostics.values():
+                    freealign_attempts += int(free_stats["attempted"])
+                    freealign_accepted += int(free_stats["accepted"])
+                    if free_stats["attempted"]:
+                        freealign_matched_nodes_sum += free_stats["matched_nodes"]
+                        freealign_matched_nodes_count += 1
+            if args.oracle_grouping:
+                oracle_groups = _oracle_groups(simple_detections_by_cav.values())
+                oracle = fuse_groups_score_weighted(oracle_groups)
+                _postprocess_and_evaluate(
+                    oracle["boxes"],
+                    oracle["scores"],
+                    ground_truth,
+                    opencood_dataset.post_processor,
                     oracle_statistics,
+                    fast=args.fast_ap,
                 )
                 oracle_fused_count += len(oracle["boxes"])
                 oracle_matched_groups += int(
@@ -1954,8 +2645,80 @@ def main() -> None:
         ),
         "naive_late": _ap(naive_statistics, args.global_sort_detections),
         "ego_only": _ap(ego_only_statistics, args.global_sort_detections),
-        "belt_geometry": _ap(belt_statistics, args.global_sort_detections),
-        "belt_association": summarize_component_counts(belt_association_counts),
+        "belt_geometry": (
+            None if args.skip_belt else _ap(belt_statistics, args.global_sort_detections)
+        ),
+        "belt_association": (
+            None if args.skip_belt else summarize_component_counts(belt_association_counts)
+        ),
+        **(
+            {
+                "alignformer_pva": _ap(
+                    alignformer_pva_statistics, args.global_sort_detections
+                ),
+                "alignformer_pva_checkpoint": str(
+                    args.alignformer_pva_checkpoint.resolve()
+                ),
+                "alignformer_pva_refine_mode": args.alignformer_pva_refine_mode,
+                "alignformer_pva_refine_min_pairs": (
+                    args.alignformer_pva_refine_min_pairs
+                ),
+                "alignformer_pva_refine_inlier_m": (
+                    args.alignformer_pva_refine_inlier_m
+                ),
+                "alignformer_pva_refine_gates_m": list(
+                    alignformer_pva_refine_config.gates_m
+                ),
+                "alignformer_pva_abstain_level": args.alignformer_pva_abstain_level,
+                "alignformer_pva_agreement_tolerance_m": (
+                    args.alignformer_pva_agreement_tolerance_m
+                ),
+                "alignformer_pva_consensus_floor": args.alignformer_pva_consensus_floor,
+                "alignformer_pva_association_distance_m": (
+                    args.alignformer_pva_association_distance
+                ),
+                "mean_alignformer_pva_fused_boxes_per_frame": (
+                    alignformer_pva_fused_count / max(frame_count, 1)
+                ),
+                "alignformer_pva_correction": {
+                    "attempts": alignformer_pva_attempts,
+                    "accepted": alignformer_pva_accepted,
+                    "mean_offset_statistic": (
+                        alignformer_pva_statistic_sum
+                        / max(alignformer_pva_statistic_count, 1)
+                    ),
+                },
+            }
+            if alignformer_pva_statistics is not None
+            else {}
+        ),
+        **(
+            {
+                "freealign": _ap(freealign_statistics, args.global_sort_detections),
+                "freealign_config": freealign_config.to_dict(),
+                "freealign_calibration": (
+                    str(args.freealign_calibration.resolve())
+                    if args.freealign_calibration is not None
+                    else None
+                ),
+                "freealign_association_distance_m": (
+                    args.freealign_association_distance
+                ),
+                "mean_freealign_fused_boxes_per_frame": (
+                    freealign_fused_count / max(frame_count, 1)
+                ),
+                "freealign_correction": {
+                    "attempts": freealign_attempts,
+                    "accepted": freealign_accepted,
+                    "mean_matched_nodes": (
+                        freealign_matched_nodes_sum
+                        / max(freealign_matched_nodes_count, 1)
+                    ),
+                },
+            }
+            if freealign_statistics is not None
+            else {}
+        ),
         **(
             {
                 "oracle_physical_id_score_weighted": _ap(

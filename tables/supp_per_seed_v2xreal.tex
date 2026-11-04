@@ -1,0 +1,19 @@
+\begin{table*}[t]
+  \centering\small
+  \caption{\textbf{V2X-Real test, per-seed paired differences to FreeAlign} of the sweep-mean AP: one column per noise seed at IoU 0.7, then mean $\pm$ standard error at the three thresholds. Every row is compared with the FreeAlign condition of its own result file, on identical noise draws.}
+  \label{tab:supp_seed_v2xreal}
+  \resizebox{\textwidth}{!}{\begin{tabular}{lcccccccc}
+    \toprule
+    row & seed 0 & seed 1 & seed 2 & seed 3 & seed 4 & AP@0.7 & AP@0.5 & AP@0.3 \\
+    \midrule
+    uncorrected late fusion & $-$.1194 & $-$.1187 & $-$.1181 & $-$.1193 & $-$.1185 & $-.1188\pm.0002$ & $-.1262\pm.0004$ & $-.0722\pm.0005$ \\
+    oracle (true pose) & +.0810 & +.0807 & +.0814 & +.0811 & +.0811 & $+.0811\pm.0001$ & $+.1012\pm.0001$ & $+.0715\pm.0001$ \\
+    propose (Wald 0.2) & $-$.0305 & $-$.0304 & $-$.0295 & $-$.0311 & $-$.0313 & $-.0306\pm.0003$ & $-.0073\pm.0005$ & $+.0111\pm.0003$ \\
+    + verify, least squares & $-$.0048 & $-$.0060 & $-$.0042 & $-$.0050 & $-$.0056 & $-.0051\pm.0003$ & $+.0103\pm.0005$ & $+.0194\pm.0004$ \\
+    + verify, two-point RANSAC & $-$.0011 & $-$.0017 & $-$.0003 & $-$.0010 & $-$.0012 & $-.0011\pm.0002$ & $+.0165\pm.0004$ & $+.0252\pm.0003$ \\
+    + agreement 1.0 m & $-$.0003 & $-$.0010 & +.0002 & $-$.0008 & $-$.0006 & $-.0005\pm.0002$ & $+.0097\pm.0003$ & $+.0153\pm.0003$ \\
+    + consensus floor 4 & +.0121 & +.0117 & +.0123 & +.0120 & +.0119 & $+.0120\pm.0001$ & $+.0262\pm.0002$ & $+.0284\pm.0003$ \\
+    + weighted refit (AlignFormer) & +.0142 & +.0138 & +.0143 & +.0140 & +.0141 & $+.0141\pm.0001$ & $+.0255\pm.0002$ & $+.0282\pm.0003$ \\
+    \bottomrule
+  \end{tabular}}
+\end{table*}

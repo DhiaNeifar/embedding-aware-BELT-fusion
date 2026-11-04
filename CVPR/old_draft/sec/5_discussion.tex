@@ -1,0 +1,17 @@
+\section{Discussion}
+\label{sec:discussion}
+
+\paragraph{Why propose, then verify.}
+A learned soft matcher and a hard geometric fit fail in opposite ways. The soft fit is never catastrophically wrong, because it averages, and never sharp, for the same reason; the hard fit is sharp when its correspondences are right and exactly wrong when they are not. Using the learned stage to decide \emph{which} correspondences are worth fitting, and the exact stage to fit them, gets the mean of the one and the median of the other. On dense \vxreal pairs at $\sigma=\SI{2}{m}$ the proposal's correspondences are 95\% precise and 98\% complete yet its residual is \SI{0.60}{m}; fitting those same correspondences exactly gives \SI{0.28}{m}, within \SI{0.01}{m} of the fit over oracle correspondences. There was nothing left to learn there; there was something left to solve.
+
+\paragraph{Why abstain, and why not learn it.}
+The clean case is the one a deployed system sees most of the time, and every aligner in Table~\ref{tab:main} damages it. The Wald test is the cheapest principled fix: the weighted solve already implies a covariance, the noise model is fitted once on held-out detector disagreement, and the only free quantity is a per-pair residual scale. A learned gate would need labels for ``this correction helped AP'', which do not exist per pair. The consensus floor is the same idea applied to the exact fit: its inlier count is evidence the rule should not discard.
+
+\paragraph{On the size of the margin.}
+The lead over an AP-tuned \freealign on the sweep mean is 0.014 \ap{0.7} on \vxreal test and 0.009 on \opvv test, with paired standard errors of 0.0001; on \opvv validation, which is almost entirely dense pairs, the same rule was 0.002 behind. It is small in absolute terms and we do not want to oversell it; the claims we would defend are that the lead is at every $\sigma$, at every IoU threshold, under delay, and at all but the noisiest cell of the bucket where \freealign is structurally strongest, while the clean case is +0.02 and the sparse bucket +0.04 to +0.05. The comparison against a \freealign tuned on pose error, the configuration its paper's protocol implies, would show a 0.07 lead; we report the harder one.
+
+\paragraph{Fair baselines.}
+Every number in this paper is a local run under one evaluator; no published number is quoted beside ours, because detector, range, postprocessor and AP implementation differ across codebases by more than the effects measured here. This is a limitation for readers who want to place the absolute numbers, and a strength for the comparisons. The \freealign re-calibration result in Sec.~\ref{sec:protocol} is, we think, a cautionary note for the robust-fusion literature: a pose estimator's natural metric and the detection metric it serves can disagree by more than the differences between methods.
+
+\paragraph{Limitations.}
+\paper handles a planar rigid error; roll, pitch and height are left to the detector. It needs at least one shared object with a confident heading, and with none it correctly does nothing, which is 10\% of \vxreal frames. Delay is measured, not modelled, and a motion-aware correction would help the moving minority we currently down-weight. The intermediate-fusion comparison exists on \opvv only, and both datasets are two-agent-pair evaluations; multi-agent consistency through a pose graph was tested and added nothing here because a third agent rarely bridges a sparse pair, but it may on denser deployments.

@@ -60,12 +60,17 @@ def parse_args() -> argparse.Namespace:
             "pooled",
             "complete",
             "complete_roi_training",
+            "geometry_only",
         ),
         default="proposals",
         help=(
             "complete stores the full unpooled BEV map, dense heads, ROI-cell "
             "indices, transforms, and source references; "
-            "complete_roi_training directly stores only compact ROI tokens"
+            "complete_roi_training directly stores only compact ROI tokens; "
+            "geometry_only stores only boxes/scores/gt_ids/gt_ious/gt_boxes/"
+            "transformation_matrix (no BEV features, tokens, or ROI-cell "
+            "indices at all) for box-geometry-only models such as "
+            "alignformer_pva that never read appearance features"
         ),
     )
     parser.add_argument(
@@ -154,11 +159,11 @@ def main() -> None:
     if args.cache_mode == "pooled" and args.bev_height is None:
         raise ValueError("pooled mode requires --bev-height and --bev-width")
     if (
-        args.cache_mode in {"complete", "complete_roi_training"}
+        args.cache_mode in {"complete", "complete_roi_training", "geometry_only"}
         and args.bev_height is not None
     ):
         raise ValueError(
-            f"{args.cache_mode} preserves native resolution; omit BEV size"
+            f"{args.cache_mode} does not store any BEV tensor; omit BEV size"
         )
     if args.device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is unavailable")
@@ -364,8 +369,14 @@ def main() -> None:
                     "agent_id": actual_agent_id,
                     "boxes": proposal["boxes"].cpu().float(),
                     "scores": proposal["scores"].cpu().float(),
-                    "features": proposal["features"].cpu().to(feature_dtype),
-                    "anchor_indices": proposal["anchor_indices"].cpu(),
+                    **(
+                        {
+                            "features": proposal["features"].cpu().to(feature_dtype),
+                            "anchor_indices": proposal["anchor_indices"].cpu(),
+                        }
+                        if args.cache_mode != "geometry_only"
+                        else {}
+                    ),
                     "gt_ids": assignment["gt_ids"],
                     "gt_ious": assignment["gt_ious"],
                     "gt_boxes": matched_gt_boxes.cpu().float(),
@@ -383,7 +394,11 @@ def main() -> None:
                         else {}
                     ),
                 }
-                if args.cache_mode in {"complete", "complete_roi_training"}:
+                if args.cache_mode in {
+                    "complete",
+                    "complete_roi_training",
+                    "geometry_only",
+                }:
                     agent_record["transformation_matrix"] = cav_content[
                         "transformation_matrix"
                     ].cpu().float()
@@ -430,7 +445,11 @@ def main() -> None:
         "schema_version": (
             3
             if args.cache_mode == "complete"
-            else (1 if args.cache_mode == "complete_roi_training" else 2)
+            else (
+                1
+                if args.cache_mode == "complete_roi_training"
+                else (4 if args.cache_mode == "geometry_only" else 2)
+            )
         ),
         "split": args.split,
         "frame_count": requested_frame_count,
@@ -487,8 +506,18 @@ def main() -> None:
             "agent_id": "physical CAV directory identifier",
             "boxes": "decoded local PointPillars proposals [x,y,z,h,w,l,yaw]",
             "scores": "sigmoid vehicle confidence for each proposal",
-            "features": "384-D native BEV cell feature selected by anchor index",
-            "anchor_indices": "dense prediction indices retained through NMS",
+            **(
+                {
+                    "features": (
+                        "384-D native BEV cell feature selected by anchor index"
+                    ),
+                    "anchor_indices": (
+                        "dense prediction indices retained through NMS"
+                    ),
+                }
+                if args.cache_mode != "geometry_only"
+                else {}
+            ),
             "gt_ids": "matched physical OPV2V object ID or null",
             "gt_ious": "rotated-BEV proposal-to-GT IoU",
             "gt_boxes": "matched local GT box; zero row for unmatched proposal",
@@ -513,10 +542,25 @@ def main() -> None:
                 if args.cache_mode == "complete"
                 else {}
             ),
-            "transformation_matrix": "this agent's local coordinates to ego",
-            "tokens": "every native BEV cell covered by every proposal",
-            "positions": "relative layout of every covered BEV cell",
-            "mask": "padding mask; false entries are real covered cells",
+            **(
+                {
+                    "transformation_matrix": (
+                        "this agent's local coordinates to ego"
+                    )
+                }
+                if args.cache_mode
+                in {"complete", "complete_roi_training", "geometry_only"}
+                else {}
+            ),
+            **(
+                {
+                    "tokens": "every native BEV cell covered by every proposal",
+                    "positions": "relative layout of every covered BEV cell",
+                    "mask": "padding mask; false entries are real covered cells",
+                }
+                if args.cache_mode == "complete_roi_training"
+                else {}
+            ),
         },
         "shards": shards,
     }

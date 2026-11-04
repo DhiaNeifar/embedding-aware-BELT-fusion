@@ -1,0 +1,51 @@
+% Fig: the misalignment model. Geometric, algorithm-independent (no AlignFormer).
+\begin{tikzpicture}[
+  >=Latex, scale=0.78, every node/.style={transform shape},
+  obj/.style={fill=black!25, draw=black!50, rounded corners=0.5pt},
+  egomk/.style={draw=green!45!black, line width=0.9pt, fill=green!45!black, fill opacity=0.15, rounded corners=0.5pt},
+  cavmk/.style={draw=orange!70!black, line width=0.9pt, fill=orange!70!black, fill opacity=0.15, rounded corners=0.5pt},
+  tick/.style={line width=0.8pt},
+]
+  % road band
+  \fill[black!5] (-0.6,0.2) rectangle (9.2,4.4);
+  \draw[black!25, dashed] (-0.6,2.3) -- (9.2,2.3);
+
+  % three true object positions (gray silhouettes), rotated slightly for variety
+  \foreach \x/\y/\a in {1.6/3.1/8, 4.4/1.3/-6, 7.2/3.4/4} {
+    \begin{scope}[shift={(\x,\y)}, rotate=\a]
+      \node[obj, minimum width=0.62cm, minimum height=0.34cm] {};
+    \end{scope}
+  }
+
+  % ego boxes p_i: tight, correct, on every object
+  \foreach \x/\y/\a in {1.6/3.1/8, 4.4/1.3/-6, 7.2/3.4/4} {
+    \begin{scope}[shift={(\x,\y)}, rotate=\a]
+      \node[egomk, minimum width=0.78cm, minimum height=0.46cm] {};
+      \draw[tick, green!45!black] (0,0) -- (0,0.33);
+    \end{scope}
+  }
+
+  % CAV boxes q_j: same uniform offset + rotation on every object (the rigid error)
+  \foreach \x/\y/\a in {1.6/3.1/8, 4.4/1.3/-6, 7.2/3.4/4} {
+    \begin{scope}[shift={($(\x,\y)+(0.62,0.5)$)}, rotate={\a+16}]
+      \node[cavmk, minimum width=0.78cm, minimum height=0.46cm] {};
+      \draw[tick, orange!70!black] (0,0) -- (0,0.33);
+    \end{scope}
+  }
+
+  % highlight T on the middle object
+  \coordinate (qmid) at ($(4.4,1.3)+(0.62,0.5)$);
+  \coordinate (pmid) at (4.4,1.3);
+  \draw[->, line width=0.8pt, black!70, dashed] (qmid) to[bend left=18] node[midway, above, font=\scriptsize, fill=white, inner sep=1pt] {$T=(R(\theta),\mathbf{t})$} (pmid);
+
+  % legend
+  \node[egomk, minimum width=0.3cm, minimum height=0.22cm] at (0.0,4.75) {};
+  \node[font=\scriptsize, anchor=west] at (0.22,4.75) {$\mathcal{P}$ (ego, true position)};
+  \node[cavmk, minimum width=0.3cm, minimum height=0.22cm] at (4.6,4.75) {};
+  \node[font=\scriptsize, anchor=west] at (4.82,4.75) {$\mathcal{Q}$ (CAV, reported pose)};
+
+  % axis icon: one shared ego frame
+  \draw[->, line width=0.7pt] (-0.4,0.6) -- (0.35,0.6) node[right, font=\scriptsize] {$x$};
+  \draw[->, line width=0.7pt] (-0.4,0.6) -- (-0.4,1.35) node[above, font=\scriptsize] {$y$};
+  \node[font=\scriptsize, anchor=west] at (-0.4,-0.05) {ego frame (shared)};
+\end{tikzpicture}

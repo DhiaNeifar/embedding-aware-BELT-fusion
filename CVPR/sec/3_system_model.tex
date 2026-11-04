@@ -1,0 +1,19 @@
+\section{System Model}
+\label{new:sec:system}
+\budget{0.5 page, 5 paragraphs, Fig.~F1. This section defines the solution's contract, so it must match the code exactly.}
+
+\begin{figure}[t]
+  \centering
+  \placeholderfig{\linewidth}{3.2cm}{\textbf{F1: the plug-in.} One box in front of fusion. Top path: late fusion (CAV boxes $\to$ transform $\to$ NMS). Bottom path: intermediate fusion (CAV points or features $\to$ transform $\to$ host). The same corrected transform feeds both. Marked ``unchanged'': the hosts. Drawn in TikZ, no run needed.}
+  \caption{\textbf{F1.} AlignFormer sits in front of any fusion family and changes only the CAV-to-ego transform.}
+\end{figure}
+
+\para{Setting}{One ego and $N$ cooperating agents, each detecting in its own frame and sending a message with its reported pose. One ego-CAV pair at a time; several CAVs repeat it. Notation for the reported transform $N_t$ and the true transform.}
+
+\para{The one transform}{Where the transform acts in each family: late fusion places boxes with it; intermediate with \texttt{proj\_first} projects points before voxelization; intermediate without it warps features. Three code paths, one matrix. This is what makes a plug-in possible, and the section's key point. \code{OpenCOOD transformation_matrix, pairwise_t_matrix} \tobuild{plugin hook}}
+
+\para{What can go wrong}{The reported pose has an error of unknown form. The message may be old by an unknown delay. Only a planar rigid error is modelled (translation and yaw); height, roll and pitch are left to the detector. The ego's own pose is the reference frame.}
+
+\para{What the plug-in may see (R1)}{Stated plainly as a list. \emph{Allowed:} both agents' boxes and scores; the reported pose; each vehicle's own LiDAR odometry; sender velocities from its own tracker. \emph{Never:} noise level or distribution, the delay, ground truth, correspondences, host internals, or any retraining. This paragraph is the paper's promise, and every experiment obeys it.}
+
+\para{Problem statement}{For each CAV and frame, causally (past and present only), output a corrected transform and hand it to the unchanged host. Success is measured by the host's AP, with pose error reported as the explanation, not the goal.}

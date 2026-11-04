@@ -1,0 +1,19 @@
+\section{Introduction}
+\budget{1 page, 5 paragraphs.}
+
+\para{The problem}{Sharing data across vehicles extends perception beyond line of sight, but only if the sender's pose is right. Open with one measured collapse from each fusion family, both at the same noise level (Table~T1 uncorrected, Table~T3 uncorrected), and the fact that uncorrected fusion can fall below the ego alone.}
+
+\para{What exists, with credit}{Plug-in correction already exists, and we say so. FreeAlign (box graph matching) and RoCo (object matching and pose graph) both claim to work with existing hosts without retraining. NEAT is a plug-in that aligns features but trains with the host. CoAnchor uses object anchors and short box histories under spatio-temporal misalignment, as its own framework, with the delay given. Credit them plainly.}
+
+\para{The question this paper asks}{Whatever the fusion family, the pose acts through one CAV-to-ego transform, which is why a plug-in can work at all. So the question is not whether to build a plug-in, but what a good one must do. What existing plug-ins leave on the table: hand-built matching declines pairs with few shared objects, and an exact fit is only as good as its hard matches; nothing tests whether a correction should be applied, so the clean case is damaged; each frame is solved alone; and in late fusion nothing compensates object motion under delay (FreeAlign leaves that to a trained network on feature maps, SyncNet). This is the paper's central paragraph.}
+
+\para{Our solution}{AlignFormer as a plug-in (Fig.~F1). What goes in: boxes, reported pose, own odometry. What comes out: one corrected transform per CAV. What it is never told: noise level, distribution, delay. One sentence on each stage, each answering one of the three gaps above. Same module, same weights, no host retraining.}
+
+\para{Contributions}{A short list, each bullet tied to a claim and an exhibit:
+\begin{itemize}\setlength\itemsep{0pt}
+  \item Propose, Verify, Abstain from boxes alone: a transformer with Sinkhorn assignment and a closed-form pose proposes, an exact fit verifies, and a Wald test on the estimator's own covariance decides whether to correct at all \claimref{C3, C6}.
+  \item The same pipeline over time, with no knowledge of the noise: measurements carried by each vehicle's odometry, robust pooling, and an online decision to keep or override the reported pose \claimref{C3, C4}.
+  \item A plug-in for unchanged hosts: above FreeAlign on the same $N$ intermediate hosts on OPV2V and V2X-Real, and able to replace built-in correction \claimref{C1, C2}.
+  \item Joint pose and latency estimation from boxes, with an observability test, for late fusion under unknown delay \claimref{C5}.
+  \item One protocol: same frames, noise draws and evaluator across all methods, reported with paired statistics.
+\end{itemize}}

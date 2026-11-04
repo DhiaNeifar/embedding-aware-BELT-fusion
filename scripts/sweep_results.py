@@ -161,8 +161,11 @@ def record_coalign_or_roco_run(
     assoc = None
     if association_json is not None:
         association_json = Path(association_json)
-        with association_json.open() as f:
-            assoc = json.load(f)
+        text = association_json.read_text()
+        # Some dataset constructors print a stray "Dataset dir: ..." line to
+        # stdout before the diagnostics script's own JSON output; skip to the
+        # first '{' instead of assuming the file is pure JSON from byte 0.
+        assoc = json.loads(text[text.index("{"):])
         _copy_source(association_json, pipeline, sweep_dimension, sweep_value)
         frames = frames if frames is not None else assoc.get("frames_evaluated")
 

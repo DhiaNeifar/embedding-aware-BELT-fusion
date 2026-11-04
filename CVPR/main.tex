@@ -1,0 +1,73 @@
+% CVPR 2027 submission -- AlignFormer as a plug-in. Template: https://github.com/cvpr-org/author-kit
+%
+% Top of this file: the NEW paper, currently an outline (highlights per paragraph, empty table shells).
+% Bottom of this file: the OLD draft of Oct 22, kept for reference only. Delete that block before submitting.
+
+\documentclass[10pt,twocolumn,letterpaper]{article}
+
+%%%%%%%%% PAPER TYPE  - PLEASE UPDATE FOR FINAL VERSION
+% \usepackage{cvpr}              % To produce the CAMERA-READY version
+\usepackage[review]{cvpr}      % To produce the REVIEW version
+% \usepackage[pagenumbers]{cvpr} % To force page numbers, e.g. for an arXiv version
+
+% Import additional packages in the preamble file, before hyperref
+\input{preamble}
+
+\definecolor{cvprblue}{rgb}{0.21,0.49,0.74}
+\usepackage[pagebackref,breaklinks,colorlinks,allcolors=cvprblue]{hyperref}
+
+%%%%%%%%% PAPER ID  - PLEASE UPDATE
+\def\paperID{*****} % *** Enter the Paper ID here
+\def\confName{CVPR}
+\def\confYear{2027}
+
+%%%%%%%%% TITLE (working title)
+\title{AlignFormer: A Plug-in Pose Corrector for\\Late and Intermediate Cooperative Perception}
+
+%%%%%%%%% AUTHORS (anonymised for review; the review option hides this block)
+\author{Anonymous CVPR submission\\
+Paper ID \paperID
+}
+
+\begin{document}
+\maketitle
+\sloppy
+
+%%%%%%%%% THE NEW PAPER (outline)
+\input{sec/00_glance}
+\input{sec/0_abstract}
+\input{sec/1_intro}
+\input{sec/2_related}
+\input{sec/3_system_model}
+\input{sec/4_method}
+\input{sec/5_experiments}
+\input{sec/6_discussion}
+\input{sec/7_conclusion}
+\input{sec/8_supplement_plan}
+\input{sec/9_ledger}
+
+%%%%%%%%% THE OLD DRAFT (Oct 22), reference only: delete from here to the bibliography before submitting
+\clearpage
+\oldbanner
+\begingroup
+\makeatletter\def\input@path{{old_draft/}}\makeatother
+\graphicspath{{old_draft/}}
+\setcounter{section}{0}
+\renewcommand{\theHsection}{old.\arabic{section}}
+\input{old_draft/sec/0_abstract}
+\input{old_draft/sec/1_intro}
+\input{old_draft/sec/2_related}
+\input{old_draft/sec/system_model}
+\input{old_draft/sec/3_method}
+\input{old_draft/sec/4_experiments}
+\input{old_draft/sec/5_discussion}
+\input{old_draft/sec/6_conclusion}
+{
+    \small
+    \bibliographystyle{ieeenat_fullname}
+    \bibliography{main}
+}
+\input{old_draft/sec/X_suppl}
+\endgroup
+
+\end{document}

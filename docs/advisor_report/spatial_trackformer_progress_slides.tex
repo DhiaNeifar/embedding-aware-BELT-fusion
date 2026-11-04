@@ -6,7 +6,7 @@
 \setbeamertemplate{footline}[frame number]
 
 \usepackage[T1]{fontenc}
-\usepackage{amsmath,booktabs}
+\usepackage{amsmath,booktabs,graphicx}
 \usepackage[dvipsnames]{xcolor}
 \usepackage{tikz}
 \usetikzlibrary{arrows.meta,positioning}
@@ -16,7 +16,7 @@
 \setbeamercolor{frametitle}{fg=accent}
 
 \title{Embedding-Aware Cooperative LiDAR Perception}
-\subtitle{Spatial TrackFormer Association and SWFormer Detector Exploration}
+\subtitle{PointPillars, BELT-Fusion, Spatial TrackFormer, and Communication Compression}
 \author{Dhia}
 \date{July 2026}
 
@@ -28,6 +28,83 @@
   \centering\small
   TrackFormer~\cite{trackformer} is adapted from temporal tracking to
   same-timestamp cross-agent association in OPV2V.
+\end{frame}
+
+\begin{frame}{PointPillars Late Fusion: Starting Detector Baseline}
+\small
+\begin{columns}[T,onlytextwidth]
+\column{0.53\textwidth}
+\begin{block}{Per-CAV detection and naive late fusion}
+\begin{enumerate}\setlength{\itemsep}{4pt}
+  \item Each CAV runs PointPillars on its local LiDAR sweep and predicts 3D
+  boxes plus vehicle confidence.
+  \item It transmits compact detection data: box geometry
+  $(x,y,z,h,w,l,\psi)$ and confidence $s$.
+  \item The ego converts source boxes into its own coordinate frame, pools
+  all detections, and applies global NMS to remove duplicates.
+\end{enumerate}
+\end{block}
+
+\column{0.43\textwidth}
+\begin{block}{Clean official OPV2V test}
+\centering
+\begin{tabular}{lc}
+\toprule
+Metric & PointPillars late \\
+\midrule
+$\mathrm{AP@0.3}$ & $0.867$ \\
+$\mathrm{AP@0.5}$ & $0.859$ \\
+$\mathrm{AP@0.7}$ & $0.782$ \\
+\bottomrule
+\end{tabular}
+\end{block}
+\end{columns}
+
+\vspace{3mm}
+\centering\footnotesize
+\alert{Limitation:} under pose noise, boxes of the same vehicle can no longer
+overlap reliably, so geometry-only NMS can split duplicates or merge neighbours.
+\end{frame}
+
+\begin{frame}{BELT-Fusion: Better Association, Then Better Box Fusion}
+\small
+\centering
+\begin{tikzpicture}[
+  font=\small,
+  box/.style={draw, rounded corners=2pt, align=center, minimum height=10mm,
+    text width=34mm},
+  bluebox/.style={box, fill=RoyalBlue!15},
+  greenbox/.style={box, fill=ForestGreen!15},
+  orangebox/.style={box, fill=BurntOrange!16},
+  arrow/.style={-{Latex[length=2mm]}, thick}, node distance=8mm]
+\node[bluebox] (cavs) {CAV detections\\boxes, scores, uncertainty};
+\node[greenbox,right=of cavs] (associate) {BELT association\\identify compatible detections};
+\node[orangebox,right=of associate] (fuse) {Uncertainty-aware box fusion\\one fused box per group};
+\draw[arrow] (cavs) -- (associate);
+\draw[arrow] (associate) -- (fuse);
+\end{tikzpicture}
+
+\vspace{4mm}
+\begin{columns}[T,onlytextwidth]
+\column{0.49\textwidth}
+\begin{block}{What BELT contributes}
+Rather than treating all overlapping boxes as equally trustworthy, BELT uses
+predicted uncertainty when grouping and averaging boxes. This makes the final
+box estimate less sensitive to a noisy partner detection.
+\end{block}
+\column{0.47\textwidth}
+\begin{block}{Observed noisy OPV2V test result}
+At $0.2$ m position noise, $0.2^\circ$ heading noise, and $100$ ms delay:
+\[
+\mathrm{AP@0.7}:\quad 0.294\;\text{(naive late)}
+\;\longrightarrow\;0.415\;\text{(BELT)}.
+\]
+\end{block}
+\end{columns}
+
+\vspace{2mm}\footnotesize
+Spatial TrackFormer is added \emph{inside the association stage}; BELT remains
+responsible for forming a fused box after a group is identified.
 \end{frame}
 
 \begin{frame}{What We Built}
@@ -343,11 +420,106 @@ local detected boxes and confidence scores.
 \begin{block}{Process and communication}
 \textbf{Source:} $F_i,P_i\rightarrow\mathcal{R}_{i,k},X_{i,k},g_{i,k}
 \rightarrow$ TrackFormer $\rightarrow(h_{i,k},z_{i,k})$; send selected query
-states, ego-frame boxes, scores, and embeddings---not the full $F_i$ map.\\
+states, ego-frame boxes, scores, and association information---not the full
+$F_i$ map.\\
 \textbf{Ego:} builds $X_{e,k},g_{e,k}$, propagates received $h_{i,k}$ through
 its BEV memory, then associates source and ego proposals. The detection head
 defines each ROI and explicitly conditions TrackFormer through $g_{i,k}$.
 \end{block}
+\vspace{1mm}\scriptsize
+\alert{Deployment distinction:} the current faithful propagated protocol
+transmits the 256-D $h_{i,k}$ so the ego can reproduce source-conditioned
+attention. The deployment-oriented independent protocol under training will
+instead transmit the final 128-D $z_{i,k}$ together with box geometry and score.
+\end{frame}
+
+\begin{frame}{Annealed Embedding: Robustness Comes from Noisy Training}
+\footnotesize
+\begin{columns}[T,onlytextwidth]
+\column{0.38\textwidth}
+\begin{block}{Curriculum / annealing}
+\begin{enumerate}\setlength{\itemsep}{2pt}
+  \item Start from the clean geometry-conditioned Spatial TrackFormer.
+  \item Fine-tune through progressively stronger position and heading noise.
+  \item Preserve physical-object identity labels across CAVs, so positive
+  pairs must remain close despite corrupted box geometry.
+\end{enumerate}
+\end{block}
+
+\begin{block}{Interpretation}
+At zero noise the clean model is stronger. Under larger errors, annealing
+trades that clean-data advantage for a substantially slower degradation.
+\end{block}
+
+\column{0.60\textwidth}
+\centering
+\includegraphics[width=\linewidth,height=0.66\textheight,keepaspectratio]
+{../../outputs/geometry_only_noise_sweep/extreme_geometry_clean_vs_curriculum.png}
+\end{columns}
+\end{frame}
+
+\begin{frame}{Communication-Efficient Association via Product Codebooks}
+\small
+\begin{columns}[T,onlytextwidth]
+\column{0.51\textwidth}
+\begin{block}{What is quantized?}
+For the faithful propagated protocol, each source object produces a 256-D
+query state $h_{S,k}$. A product codebook splits it into eight groups and
+replaces each group by one index from a learned 256-entry dictionary.
+\[
+256\times32\ \text{bits}\quad\longrightarrow\quad8\times8\ \text{bits}=64\ \text{bits}.
+\]
+The ego reconstructs an approximation of $h_{S,k}$ before its cross-agent
+attention step. The learned detector and embedder weights are unchanged.
+\end{block}
+
+\column{0.45\textwidth}
+\begin{block}{Clean OPV2V test: association payload only}
+\centering
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{lrr}
+\toprule
+Method & bytes/object & AP@0.7 \\
+\midrule
+Raw propagated state & 1,024 & 0.710 \\
+8$\times$256 codebook & 8 & 0.704 \\
+\bottomrule
+\end{tabular}
+}
+
+\vspace{2mm}
+At $\approx21.4$ transmitted source objects/frame:
+\[
+21.9\ \text{kB/frame}\quad\longrightarrow\quad171\ \text{B/frame}.
+\]
+\end{block}
+\end{columns}
+
+\vspace{3mm}\footnotesize
+Box geometry and confidence remain necessary for final fusion and are sent
+alongside the association message. The table isolates the association payload:
+the compression is $128\times$, with a $0.006$ AP@0.7 loss in this clean test.
+\end{frame}
+
+\begin{frame}{End-to-End Geometry-Noise Sweep: AP@0.7}
+\centering
+\IfFileExists{../../outputs/belt_geometry_noise_sweep/ap70_geometry_noise_comparison.png}{%
+  \includegraphics[width=0.95\linewidth,height=0.78\textheight,keepaspectratio]
+  {../../outputs/belt_geometry_noise_sweep/ap70_geometry_noise_comparison.png}%
+}{%
+  \begin{tikzpicture}
+    \node[draw=accent, rounded corners=3pt, minimum width=0.9\linewidth,
+      minimum height=0.53\textheight, align=center, fill=accent!6]
+      {\Large Reserved for the completed end-to-end sweep figure\\[4mm]
+       \normalsize Vehicle AP@0.7 versus increasing geometry noise\\
+       \small PointPillars naive late \quad|\quad Spatial TrackFormer\\
+       Annealed Spatial TrackFormer \quad|\quad Annealed + product codebook};
+  \end{tikzpicture}%
+}
+
+\vspace{2mm}\footnotesize
+All methods use the same OPV2V test frames and the same noise seed. This is the
+decision figure: it measures final cooperative detection, not association alone.
 \end{frame}
 
 \begin{frame}{Embedding Results and Current Conclusion}

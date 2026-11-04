@@ -210,6 +210,7 @@ checkpoints/
 pointpillar_late_fusion*/
 outputs/*
 !outputs/.gitkeep
+!outputs/README.md
 *.pth
 *.pt
 *.ckpt
@@ -239,5 +240,6 @@ __marimo__/
 .streamlit/secrets.toml
 
 # Large local-only resources (checkpoints, reference PDFs) — not versioned
-/models/
+/models/*
+!/models/README.md
 /papers/

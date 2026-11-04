@@ -1,8 +1,11 @@
 import math
+from itertools import combinations
 
 import torch
 
 from embedding_aware_belt_fusion.integration.localization import (
+    _refine_se2,
+    _se2_from_two_pairs,
     apply_se2_correction,
     correspondences_by_source,
     estimate_se2_ransac,
@@ -98,6 +101,91 @@ def test_correspondences_by_source_filters_incomplete_and_single_matches():
     sources, targets = correspondences["source1"]
     assert sources.shape == (2, 2)
     assert targets.shape == (2, 2)
+
+
+def _reference_estimate_se2_ransac(source_centers, ego_centers, *, inlier_threshold, max_hypotheses=128):
+    """Pre-vectorization implementation, kept here only as a pinning oracle.
+
+    Identical to the ``estimate_se2_ransac`` loop before it was rewritten to
+    score all hypotheses in one batched pass; see that function's docstring
+    for the tie-breaking argument this is pinning.
+    """
+    if len(source_centers) < 2:
+        return None
+    source = source_centers.detach().float()
+    target = ego_centers.detach().float()
+    pairs = list(combinations(range(len(source)), 2))[:max_hypotheses]
+    best = None
+    for first, second in pairs:
+        if torch.linalg.vector_norm(source[second] - source[first]) < 0.25:
+            continue
+        rotation, translation = _se2_from_two_pairs(
+            source[[first, second]], target[[first, second]]
+        )
+        residual = torch.linalg.vector_norm(
+            source @ rotation.T + translation - target, dim=-1
+        )
+        inliers = residual <= inlier_threshold
+        candidate = (int(inliers.sum()), -float(residual[inliers].sum()))
+        if best is None or candidate > best[0]:
+            best = candidate, rotation, translation, inliers
+    if best is None or best[0][0] < 2:
+        return None
+    return best[1], best[2], best[3]  # rotation, translation, inliers (pre-refine)
+
+
+def test_vectorized_hypothesis_selection_matches_reference_loop():
+    # Deliberately messy: random points plus near-duplicates (to exercise the
+    # 0.25m degenerate-pair filter) and a cluster designed to create tied
+    # inlier counts, across varying point-set sizes including ones that
+    # exceed max_hypotheses's pair budget.
+    generator = torch.Generator().manual_seed(0)
+    for n_points in (2, 3, 5, 9, 14, 20):
+        for trial in range(5):
+            source = torch.randn(n_points, 2, generator=generator) * 10
+            if n_points >= 4:
+                # Force some near-duplicate pairs so the 0.25m filter actually
+                # discards hypotheses, not just skips a code path untested.
+                source[1] = source[0] + 0.01
+            noise = torch.randn(n_points, 2, generator=generator) * 0.05
+            yaw = float(torch.rand(1, generator=generator) * 2 * math.pi - math.pi)
+            translation = torch.randn(2, generator=generator) * 5
+            target = source @ _rotation(yaw).T + translation + noise
+
+            reference = _reference_estimate_se2_ransac(
+                source, target, inlier_threshold=0.2, max_hypotheses=16
+            )
+            result = estimate_se2_ransac(
+                source, target, inlier_threshold=0.2, max_hypotheses=16
+            )
+
+            if reference is None:
+                assert result is None, (n_points, trial)
+                continue
+            assert result is not None, (n_points, trial)
+            _, _, ref_inliers = reference
+            # The vectorization only changed hypothesis SELECTION; the Kabsch
+            # refine steps that follow are untouched, shared code. So feeding
+            # the reference loop's selected inlier set through that same
+            # refine path must reproduce the production result exactly if
+            # (and only if) selection picked the same winning hypothesis.
+            ref_rotation, ref_translation = _refine_se2(
+                source[ref_inliers], target[ref_inliers]
+            )
+            ref_residual = torch.linalg.vector_norm(
+                source @ ref_rotation.T + ref_translation - target, dim=-1
+            )
+            ref_final_inliers = ref_residual <= 0.2
+            if int(ref_final_inliers.sum()) >= 2:
+                ref_rotation, ref_translation = _refine_se2(
+                    source[ref_final_inliers], target[ref_final_inliers]
+                )
+            assert torch.allclose(result["rotation"], ref_rotation, atol=1e-5), (
+                n_points, trial,
+            )
+            assert torch.allclose(
+                result["translation"], ref_translation, atol=1e-5
+            ), (n_points, trial)
 
 
 def test_apply_se2_correction_transforms_center_and_yaw():
