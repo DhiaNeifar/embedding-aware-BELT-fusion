@@ -48,9 +48,28 @@ def run(path: Path):
         result = variants.VARIANTS[name](inputs)
         decided, scale = result if isinstance(result, tuple) else (result, None)   # (decided, CAV-box score scale)
         ap[name] = evaluate.ap_table(base, evaluate.score_condition(base, records, cache, decided, nms, score_scale=scale))
+        if _W.get("pose_error"):
+            ap.setdefault("pose_error", {})[name] = pose_error(records, cache, decided)
     if float(cache["sigma"]) == 0.0:
         ap["oracle"] = evaluate.ap_table(base, evaluate.score_condition(base, records, cache, None, nms, oracle=True))
     return float(cache["sigma"]), int(cache["seed"]), ap
+
+
+def pose_error(records, cache, decided) -> dict:
+    """Translation and yaw error of every CAV's corrected CAV-to-ego transform against the recorded poses (evaluation
+    only: the truth is read here, after the estimator has decided). Same export as scripts/pose_accuracy.py reads."""
+    from embedding_aware_belt_fusion.alignformer_ext import odometry, poses
+
+    arrays = poses.build(base, records, odometry.ACTIVE.frames, cache, decided)
+    t, yaw = [], []
+    for f, cav, transform in zip(arrays["frame_index"], arrays["cav_id"], arrays["transform"]):
+        record = records[int(f)]
+        residual = np.linalg.inv(transform) @ base.x1_to_x2(record.cav_poses[str(cav)], record.ego_pose)
+        t.append(float(np.hypot(residual[0, 3], residual[1, 3])))
+        yaw.append(abs(float(np.degrees(np.arctan2(residual[1, 0], residual[0, 0])))))
+    t, yaw = np.array(t), np.array(yaw)
+    return {"pairs": int(len(t)), "median_m": float(np.median(t)), "p90_m": float(np.percentile(t, 90)),
+            "median_deg": float(np.median(yaw)), "p90_deg": float(np.percentile(yaw, 90))}
 
 
 def delta_label(variant: str) -> str:
@@ -78,6 +97,12 @@ def main() -> None:
         help="real LiDAR odometry table (scripts/build_odometry_table.py) for the temporal layer; needs --geometry-cache",
     )
     parser.add_argument("--geometry-cache", type=Path, default=Path("outputs/r140_geometry_test_cache"))
+    parser.add_argument("--odometry-error", choices=["none", "white", "ar1", "scale", "yawdrift"], default="none",
+                        help="audit E3: inject this odometry error into the odometry the estimator is fed "
+                             "(alignformer_ext.odometry.PerturbedOdometry); the estimator still assumes LOAM accuracy")
+    parser.add_argument("--odometry-error-seed", type=int, default=0)
+    parser.add_argument("--pose-error", action="store_true",
+                        help="also report each variant's pose error against the recorded poses (needs --odometry)")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     base.fusion_core.set_filters(args.eval_range[0], args.eval_range[1], -3.0, 1.0, 6.0)
@@ -105,6 +130,11 @@ def main() -> None:
         from embedding_aware_belt_fusion.alignformer_ext import odometry
 
         odometry.ACTIVE = odometry.OdometryTable.for_records(args.odometry, args.geometry_cache, _W["records"])
+        if args.odometry_error != "none":
+            odometry.ACTIVE = odometry.PerturbedOdometry(odometry.ACTIVE, args.odometry_error, args.odometry_error_seed)
+    elif args.odometry_error != "none" or args.pose_error:
+        raise SystemExit("--odometry-error and --pose-error need --odometry")
+    _W["pose_error"] = args.pose_error
     results = {}
     with cf.ProcessPoolExecutor(max_workers=args.workers, mp_context=mp.get_context("fork")) as pool:
         futures = [pool.submit(run, path) for path in paths]
@@ -127,7 +157,16 @@ def main() -> None:
                         "mean": float(values.mean()), "std": float(values.std()), "n": len(values)
                     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps({"variants": names, "oracle": oracle, "summary": summary, "per_seed": results}, indent=1))
+    if args.pose_error:
+        for sigma, per_seed in results.items():
+            for row in names:
+                for key in ("median_m", "p90_m", "median_deg", "p90_deg"):
+                    values = np.array([s["ap"]["pose_error"][row][key] for s in per_seed])
+                    summary[sigma].setdefault("pose_error", {}).setdefault(row, {})[key] = float(values.mean())
+    setting = {"odometry": str(args.odometry), "odometry_error": args.odometry_error,
+               "odometry_error_seed": args.odometry_error_seed}
+    args.output.write_text(json.dumps({"variants": names, "oracle": oracle, "setting": setting, "summary": summary,
+                                       "per_seed": results}, indent=1))
     print(f"Wrote {args.output}")
 
     for bucket in evaluate.BUCKETS:

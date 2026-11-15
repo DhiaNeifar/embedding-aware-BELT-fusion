@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import check_verify_core  # noqa: E402  (frame-table loader)
 import reproduce_opv2v_sweep as base  # noqa: E402
 
-from embedding_aware_belt_fusion.alignformer_ext import propose_cache  # noqa: E402
+from embedding_aware_belt_fusion.alignformer_ext import noise_kinds, odometry, propose_cache  # noqa: E402
 
 _W = {}
 
@@ -36,8 +36,11 @@ def run(condition):
     sigma, seed = condition
     path = propose_cache.condition_path(_W["output_dir"], sigma, seed)
     if not path.exists():
+        noise = None
+        if _W["noise_kind"] != "benchmark":
+            noise = noise_kinds.PoseNoise(_W["noise_kind"], sigma, seed, _W["frames"])
         cache = propose_cache.build_condition(
-            base, _W["records"], _W["model"], _W["robust"], sigma, seed, freealign_config=_W["freealign"]
+            base, _W["records"], _W["model"], _W["robust"], sigma, seed, freealign_config=_W["freealign"], noise=noise
         )
         tmp = path.with_suffix(".tmp.npz")
         np.savez(tmp, **cache)
@@ -54,6 +57,11 @@ def main() -> None:
     parser.add_argument("--seeds", type=int, default=20)
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/propose_cache_opv2v"))
     parser.add_argument("--workers", type=int, default=20)
+    parser.add_argument("--noise-kind", default="benchmark", choices=("benchmark",) + noise_kinds.KINDS,
+                        help="T5: drift / bias / mixed (noise_kinds.py); needs --odometry and --geometry-cache for the "
+                             "scenario of each frame. Use a separate --output-dir per kind.")
+    parser.add_argument("--odometry", type=Path, default=None, help="odometry table (only for its frame keys)")
+    parser.add_argument("--geometry-cache", type=Path, default=None)
     args = parser.parse_args()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -69,11 +77,15 @@ def main() -> None:
         model=base.load_alignformer_pva(args.checkpoint, torch.device("cpu"))[0],
         robust=base.RobustSolveConfig(mode="huber", iterations=2),
         freealign=base.freealign_config_from_calibration(args.freealign_calibration),
-        output_dir=args.output_dir,
+        output_dir=args.output_dir, noise_kind=args.noise_kind, frames=None,
     )
+    if args.noise_kind != "benchmark":
+        if args.odometry is None or args.geometry_cache is None:
+            raise SystemExit("--noise-kind other than benchmark needs --odometry and --geometry-cache (frame keys)")
+        _W["frames"] = odometry.OdometryTable.for_records(args.odometry, args.geometry_cache, _W["records"]).frames
     with cf.ProcessPoolExecutor(max_workers=args.workers, mp_context=mp.get_context("fork")) as pool:
         futures = [pool.submit(run, c) for c in conditions]
-        for future in tqdm(cf.as_completed(futures), total=len(futures), desc="propose cache (conditions)"):
+        for future in tqdm(cf.as_completed(futures), total=len(futures), desc=f"propose cache {args.noise_kind} (conditions)"):
             future.result()
 
 

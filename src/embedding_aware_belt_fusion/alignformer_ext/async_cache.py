@@ -47,13 +47,24 @@ def _pose2d(matrix) -> np.ndarray:
     return np.array([m[0, 3], m[1, 3], np.arctan2(m[1, 0], m[0, 0])])
 
 
+def sender_odometry():
+    """The odometry table every sender tracks with; refuses to run without one rather than fall back on true poses."""
+    from embedding_aware_belt_fusion.alignformer_ext import odometry
+
+    if odometry.ACTIVE is None:
+        raise RuntimeError("sender tracking needs odometry.ACTIVE (pass --odometry); it never uses true poses")
+    return odometry.ACTIVE
+
+
 def cav_velocities(base, records, scenarios: List[str]) -> Dict[Tuple[int, str, int], np.ndarray]:
     """(frame, CAV id, box index) -> velocity (m per frame) in that CAV's own frame at that frame.
 
     Each CAV tracks its own detections (greedy constant-velocity association, 2 m gate) in a frame made stationary
-    by its own odometry (here its true poses, i.e. drift-free odometry over the few frames used) and reports the
-    displacement over up to ``VELOCITY_FRAMES`` past frames; a box without history gets zero velocity.
+    by its own odometry (odometry.ACTIVE: real LiDAR odometry on V2X-Real, the recorded motion on OPV2V; never the
+    true pose) and reports the displacement over up to ``VELOCITY_FRAMES`` past frames; a box without history gets
+    zero velocity.
     """
+    table = sender_odometry()
     out: Dict[Tuple[int, str, int], np.ndarray] = {}
     agents = sorted({a for r in records for a in r.cav_boxes})
     for agent in agents:
@@ -61,12 +72,12 @@ def cav_velocities(base, records, scenarios: List[str]) -> Dict[Tuple[int, str, 
         for f, record in enumerate(records):
             if scenarios[f] != prev:
                 active, prev = [], scenarios[f]
-            if agent not in record.cav_boxes or agent not in record.cav_poses or len(record.cav_boxes[agent]) == 0:
+            pose = table.pose2d(f, agent) if agent in record.cav_boxes else None
+            if pose is None or len(record.cav_boxes[agent]) == 0:
                 for track in active:
                     track["miss"] += 1
                 active = [t for t in active if t["miss"] <= MAX_MISS]
                 continue
-            pose = _pose2d(base.x1_to_x2(record.cav_poses[agent], [0.0] * 6))
             local = np.asarray(record.cav_boxes[agent], np.float64)[:, :2]
             c, s = np.cos(pose[2]), np.sin(pose[2])
             world = np.stack([pose[0] + c * local[:, 0] - s * local[:, 1], pose[1] + s * local[:, 0] + c * local[:, 1]], 1)

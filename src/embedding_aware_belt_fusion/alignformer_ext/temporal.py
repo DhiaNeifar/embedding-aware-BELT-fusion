@@ -74,6 +74,10 @@ _IRLS_ITERATIONS = 10
 CONSISTENCY_LEVEL = 0.99       # chi2(3) quantile a measurement must fall within to agree with the window estimate
 LOAM_KITTI = (0.0055, 0.0013)  # LOAM on the KITTI odometry benchmark: 0.55 % of distance, 0.0013 deg/m
 _CONSISTENCY_BOUND = float(chi2.ppf(CONSISTENCY_LEVEL, 3))
+# Audit E5, read-only: when a list, temporal_decisions appends (pair, pooled estimate, its covariance, applied) for every
+# pooled estimate it forms. None (the default) records nothing and changes nothing.
+DIAGNOSTICS = None
+_LAST_COVARIANCE = None
 
 
 @dataclass(frozen=True)
@@ -186,8 +190,10 @@ def _robust_gls_agreement(estimates: np.ndarray, odometry_covs: List[np.ndarray]
     (default ``noise + C``) within chi2(3) at ``CONSISTENCY_LEVEL``."""
     x = np.array([np.median(estimates[:, 0]), np.median(estimates[:, 1]),
                   np.arctan2(np.median(np.sin(estimates[:, 2])), np.median(np.cos(estimates[:, 2])))])
+    global _LAST_COVARIANCE
     n = len(estimates)
     if n == 1:
+        _LAST_COVARIANCE = noise + odometry_covs[0]
         return estimates[0].copy(), 1.0
     shared = np.empty((3 * n, 3 * n))
     for a in range(n):
@@ -211,6 +217,7 @@ def _robust_gls_agreement(estimates: np.ndarray, odometry_covs: List[np.ndarray]
         x[2] = _wrap(x[2])
         if np.abs(step).max() < 1e-7:
             break
+    _LAST_COVARIANCE = np.linalg.inv(normal)        # covariance of x under the final weights (read by DIAGNOSTICS only)
     r = estimates - x
     r[:, 2] = _wrap(r[:, 2])
     if spread is not None:
@@ -229,7 +236,7 @@ def _measurements(inputs) -> np.ndarray:
     return inputs.scatter(decided)
 
 
-def temporal_decisions(inputs, settings: TemporalSettings = TemporalSettings()) -> np.ndarray:
+def temporal_decisions(inputs, settings: TemporalSettings = TemporalSettings(), measurements=None) -> np.ndarray:
     """(P, 3) psi, tx, ty per cached pair from each CAV's robust fixed-lag pose estimate.
 
     Delayed messages (an asynchronous cache, async_cache.py, carries ``past_frame``): the reported pose and the CAV's
@@ -238,10 +245,12 @@ def temporal_decisions(inputs, settings: TemporalSettings = TemporalSettings()) 
     base, records, cache = inputs.base, inputs.records, inputs.cache
     if base is None:
         raise ValueError("alignformer_t needs PairInputs(base=...) for the CAVs' reported (noisy) poses")
-    from embedding_aware_belt_fusion.alignformer_ext.propose_cache import noisy_poses
+    from embedding_aware_belt_fusion.alignformer_ext.propose_cache import noise_of, noisy_poses
 
     sigma, seed = float(cache["sigma"]), int(cache["seed"])
-    decided = _measurements(inputs)
+    pose_noise = noise_of(cache)   # the reported poses of a T5 noise kind; None = the benchmark draws
+    # the per-frame decisions to pool: alignformer_c's by default, any (P, 3) array otherwise (audit E2 baselines)
+    decided = _measurements(inputs) if measurements is None else np.asarray(measurements, np.float32)
     scale = _NoiseScale(settings.scale_memory)
     table = odometry.active()
 
@@ -264,7 +273,7 @@ def temporal_decisions(inputs, settings: TemporalSettings = TemporalSettings()) 
         elif windows:
             ego_odo, q_ego = _odometry(_pose2d(base.x1_to_x2(prev.ego_pose, record.ego_pose)), settings, seed, f, "ego")
         alive: Dict[str, deque] = {}
-        for cav_id, pose in noisy_poses(base, record, f, sigma, seed).items():
+        for cav_id, pose in noisy_poses(base, record, f, sigma, seed, pose_noise).items():
             window = windows.get(cav_id)
             cav_now, cav_prev = record.cav_poses.get(cav_id), prev.cav_poses.get(cav_id) if prev is not None else None
             message_frame = f
@@ -275,7 +284,7 @@ def temporal_decisions(inputs, settings: TemporalSettings = TemporalSettings()) 
                 g = int(cache["past_frame"][q])
                 if g not in message_poses:
                     message_poses.clear()
-                    message_poses[g] = noisy_poses(base, records[g], g, sigma, seed)
+                    message_poses[g] = noisy_poses(base, records[g], g, sigma, seed, pose_noise)
                 pose = message_poses[g][cav_id]
                 cav_now = records[g].cav_poses.get(cav_id)
                 cav_prev = records[g - 1].cav_poses.get(cav_id) if g > 0 else None
@@ -312,6 +321,7 @@ def temporal_decisions(inputs, settings: TemporalSettings = TemporalSettings()) 
                 residual = window[-1][0] - x
                 residual[2] = _wrap(residual[2])
                 scale.observe_spread(residual)
+            applied = True
             if settings.consistency != "off":
                 if agree > 0.5:
                     scale.reported_error.append(float(np.hypot(*(x[:2] - n[:2]))))
@@ -320,7 +330,11 @@ def temporal_decisions(inputs, settings: TemporalSettings = TemporalSettings()) 
                     level = scale.localization_level()
                     window_spread = float(np.median(np.hypot(*(np.array([z for z, _, _ in window])[:, :2] - x[:2]).T)))
                     if settings.consistency == "majority" or level is None or window_spread >= level:
-                        continue
+                        applied = False
+            if DIAGNOSTICS is not None and p is not None:
+                DIAGNOSTICS.append((int(p), x.copy(), np.array(_LAST_COVARIANCE, copy=True), applied))
+            if not applied:
+                continue
             if p is not None:
                 correction = compose(x, inverse(n))
                 out[p] = (correction[2], correction[0], correction[1])

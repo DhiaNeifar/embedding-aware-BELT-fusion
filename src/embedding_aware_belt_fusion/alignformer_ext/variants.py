@@ -105,10 +105,46 @@ alignformer_tk_w50 = _temporal("alignformer_tk, 50-frame window.", odometry_sd=(
                                consistency="adaptive", window=50)
 
 
+# Ablation (T7): the paper's method built up one stage at a time, on alignformer_c's settings.
+def propose_only(inputs: PairInputs) -> np.ndarray:
+    """Propose alone: the soft Sinkhorn + weighted Kabsch estimate on every attempted pair; no Verify, no Abstain."""
+    return inputs.scatter(inputs.cache["propose"][inputs.attempted])
+
+
+def propose_verify(inputs: PairInputs) -> np.ndarray:
+    """Propose -> Verify, no Abstain: Wald level 1.0 (threshold zero, every proposal passes) and the agreement rule
+    off (Verify's exact fit is used wherever it engaged, the proposal elsewhere). Otherwise alignformer_c."""
+    return _one_frame(inputs, replace(verify_cpp.VerifySettings(), heading_weight=0.0, abstain_level=1.0,
+                                      agree_tolerance_m=1e9, consensus_floor=0))
+
+
+alignformer_pool = _temporal("alignformer_tk without Abstain over time (no window-agreement test): pooling only.",
+                             odometry_sd=(0.0, 0.0), odometry_rel=_LOAM, consistency="off")
+
+
+def alignformer_stable(inputs: PairInputs) -> np.ndarray:
+    """Full temporal method followed by the object-association stability certificate."""
+    from embedding_aware_belt_fusion.alignformer_ext import fusion_stability
+
+    return fusion_stability.certify(inputs, alignformer_tk(inputs))
+
+
+def alignformer_symmetry(inputs: PairInputs) -> np.ndarray:
+    """Full temporal estimate projected onto significant correspondence-symmetry pose classes."""
+    from embedding_aware_belt_fusion.alignformer_ext import symmetry_temporal
+
+    return symmetry_temporal.decide(inputs, alignformer_tk(inputs))
+
+
 VARIANTS: Dict[str, Callable[[PairInputs], np.ndarray]] = {
     "alignformer": alignformer,
     "alignformer_c": alignformer_c,
     "alignformer_tk": alignformer_tk,
+    "propose_only": propose_only,
+    "propose_verify": propose_verify,
+    "alignformer_pool": alignformer_pool,
+    "alignformer_stable": alignformer_stable,
+    "alignformer_symmetry": alignformer_symmetry,
     "alignformer_odo1": alignformer_odo1,
     "alignformer_odo4": alignformer_odo4,
     "alignformer_odo8": alignformer_odo8,
@@ -116,3 +152,14 @@ VARIANTS: Dict[str, Callable[[PairInputs], np.ndarray]] = {
     "alignformer_tk_w10": alignformer_tk_w10,
     "alignformer_tk_w50": alignformer_tk_w50,
 }
+
+
+# Audit E2 baselines (no learned Propose): registered here so the sweep's --variants accepts them.
+from embedding_aware_belt_fusion.alignformer_ext import e2_baselines  # noqa: E402
+
+VARIANTS.update(e2_baselines.BASELINES)
+
+# Assessment EXP-003: other plug-ins' per-frame corrections pooled with AlignFormer's pooling (ablation of pooling).
+from embedding_aware_belt_fusion.alignformer_ext import pooled_baselines  # noqa: E402
+
+VARIANTS.update(pooled_baselines.BASELINES)

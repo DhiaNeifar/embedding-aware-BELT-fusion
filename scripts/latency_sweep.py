@@ -6,12 +6,14 @@ is never told the delay. Rows (``*_frame`` = the one-frame method, alignformer_c
 time, alignformer_tk; which one to report under delay is decided on V2X-Real validation):
 
 * ``bare`` (reported pose, stale boxes), ``oracle`` (true pose, stale boxes);
-* ``freealign``: the baseline, latency ignored; ``freealign_clock``: with its authors' clock search;
+* ``freealign``: the baseline, exactly as Chenyi's reimplementation runs it (latency ignored);
 * ``ignored``: AlignFormer with the latency ignored;
 * ``latency``: AlignFormer on the boxes moved by the estimated latency (latency.refine_latency: continuous joint pose
   and latency fit, accepted only if significant against "no delay", pooled per CAV);
 * ``latency_scores``: plus staleness-aware scores (fusion.staleness_confidence);
-* ``told``: AlignFormer with the boxes moved by the TRUE delay, plus staleness scores (upper bound, not a method).
+* ``told``, ``told_scores``: ANALYSIS ROWS ONLY (assessment 2026_11_11, known-delay oracle, re-added at the authors'
+  request on 2026-11-12). The same full method and staleness scores with every pair's estimated latency replaced by
+  the true injected delay. The method itself never reads the delay; these rows bound how much delay estimation costs.
 
 Also reports the latency estimate's error.
 """
@@ -37,11 +39,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import check_verify_core  # noqa: E402
 import reproduce_opv2v_sweep as base  # noqa: E402
 
-from embedding_aware_belt_fusion.alignformer_ext import async_cache, evaluate, freealign_clock, fusion, latency, variants  # noqa: E402
+from embedding_aware_belt_fusion.alignformer_ext import async_cache, evaluate, fusion, fusion_stability, latency, symmetry_temporal, variants  # noqa: E402
 
 _W = {}
-METHODS = ["ignored", "latency", "latency_scores", "told"]
-ROWS = ["bare", "oracle", "freealign", "freealign_clock"] + [m + suffix for m in METHODS for suffix in ("_frame", "")]
+METHODS = ["ignored", "latency", "latency_scores"]
+ROWS = ["bare", "oracle", "freealign"] + [m + suffix for m in METHODS for suffix in ("_frame", "")]
+ROWS += ["ignored_stable", "latency_stable", "latency_scores_stable"]
+ROWS += ["ignored_symmetry", "latency_symmetry", "latency_scores_symmetry"]
+ROWS += ["told", "told_scores"]
 
 
 def run(condition):
@@ -49,26 +54,40 @@ def run(condition):
     delay, sigma, seed = condition
     records, nms, model, robust = _W["records"], _W["nms"], _W["model"], _W["robust"]
     load = lambda comp: dict(np.load(async_cache.condition_path(_W["async_dir"], sigma, seed, delay, comp)))
-    raw, known = load(False), load(True)
+    raw = load(False)
     score = lambda cache, decided=None, **kw: evaluate.ap_table(base, evaluate.score_condition(base, records, cache, decided, nms, **kw))
     one_frame, over_time = variants.alignformer_c, variants.alignformer_tk
     ap = {"bare": score(raw), "oracle": score(raw, oracle=True), "freealign": score(raw, freealign=True)}
-    clock, _ = freealign_clock.freealign_with_clock_search(base, records, raw, _W["freealign"], _W["scenarios"])
-    ap["freealign_clock"] = score(raw, clock)
 
     raw_inputs = variants.PairInputs(records, raw, model, robust, base=base)
-    known_inputs = variants.PairInputs(records, known, model, robust, base=base)
-    known_scale = fusion.staleness_confidence(known, _W["table"], np.full(len(known["frame"]), delay))
     grid = latency.latency_grid(records, raw, model, robust, base, _W["taus"])
     _, tau, _ = latency.refine_latency(grid, raw, _W["scenarios"])
     moved, inputs = latency.decide_at(records, raw, tau, model, robust, base)
     scale = fusion.staleness_confidence(moved, _W["table"], tau)
     for suffix, method in (("_frame", one_frame), ("", over_time)):
         decided = method(inputs)
-        ap["ignored" + suffix] = score(raw, method(raw_inputs))
+        ignored_decided = method(raw_inputs)
+        ap["ignored" + suffix] = score(raw, ignored_decided)
         ap["latency" + suffix] = score(moved, decided)
         ap["latency_scores" + suffix] = score(moved, decided, score_scale=scale)
-        ap["told" + suffix] = score(known, method(known_inputs), score_scale=known_scale)
+        if suffix == "":
+            full_raw_decided, full_moved_decided = ignored_decided, decided
+    raw_stable = fusion_stability.certify(raw_inputs, full_raw_decided)
+    moved_stable = fusion_stability.certify(inputs, full_moved_decided)
+    ap["ignored_stable"] = score(raw, raw_stable)
+    ap["latency_stable"] = score(moved, moved_stable)
+    ap["latency_scores_stable"] = score(moved, moved_stable, score_scale=scale)
+    raw_symmetry = symmetry_temporal.decide(raw_inputs, full_raw_decided)
+    moved_symmetry = symmetry_temporal.decide(inputs, full_moved_decided)
+    ap["ignored_symmetry"] = score(raw, raw_symmetry)
+    ap["latency_symmetry"] = score(moved, moved_symmetry)
+    ap["latency_scores_symmetry"] = score(moved, moved_symmetry, score_scale=scale)
+    # Known-delay oracle (analysis only): the true delay in place of the estimate, everything else unchanged.
+    told = np.full(np.shape(tau), float(delay))
+    told_moved, told_inputs = latency.decide_at(records, raw, told, model, robust, base)
+    told_decided = over_time(told_inputs)
+    ap["told"] = score(told_moved, told_decided)
+    ap["told_scores"] = score(told_moved, told_decided, score_scale=fusion.staleness_confidence(told_moved, _W["table"], told))
     c = tau[grid[_W["taus"][0]]["inputs"].attempted]
     accuracy = {"exact": float(np.mean(np.abs(c - delay) < 0.5)), "within_1": float(np.mean(np.abs(c - delay) <= 1)),
                 "mae_ms": float(np.mean(np.abs(c - delay)) * 100.0)}
@@ -85,10 +104,15 @@ def main() -> None:
     parser.add_argument("--opencood-config", type=Path, default=Path("configs/pointpillar_late_fusion_r140.yaml"))
     parser.add_argument("--eval-range", type=float, nargs=2, default=[140.0, 40.0], metavar=("X", "Y"))
     parser.add_argument("--taus", type=int, nargs="+", default=list(range(7)), help="candidate latencies (frames)")
-    parser.add_argument("--odometry", type=Path, default=None,
-                        help="real LiDAR odometry table (scripts/build_odometry_table.py) for the pooled rows")
+    parser.add_argument("--odometry", type=Path, required=True,
+                        help="odometry table (scripts/build_odometry_table.py): pooled rows and the senders' tracking")
     parser.add_argument("--max-seeds", type=int, default=None)
     parser.add_argument("--workers", type=int, default=20)
+    parser.add_argument("--staleness-table", choices=["test", "causal", "other"], default="test",
+                        help="audit X1: where the staleness table is fitted. test = these frames (the paper's run); "
+                             "causal = per frame, from errors already observed before it; other = --staleness-from")
+    parser.add_argument("--staleness-from", nargs=3, type=Path, metavar=("FRAME_TABLE", "GEOMETRY_CACHE", "ODOMETRY"),
+                        help="the split the table is fitted on with --staleness-table other (e.g. V2X-Real validation)")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     base.fusion_core.set_filters(args.eval_range[0], args.eval_range[1], -3.0, 1.0, 6.0)
@@ -107,18 +131,29 @@ def main() -> None:
         raise FileNotFoundError(f"no raw + compensated condition pairs in {args.async_dir}")
     records = check_verify_core.load_frame_table(args.frame_table)
     scenarios = async_cache.scenario_ids(args.geometry_cache)
+    from embedding_aware_belt_fusion.alignformer_ext import odometry
+
+    horizons = range(max(args.taus) + 1)
+    if args.staleness_table == "other":
+        if args.staleness_from is None:
+            raise SystemExit("--staleness-table other needs --staleness-from FRAME_TABLE GEOMETRY_CACHE ODOMETRY")
+        other_table, other_geometry, other_odometry = args.staleness_from
+        other = check_verify_core.load_frame_table(other_table)
+        odometry.ACTIVE = odometry.OdometryTable.for_records(other_odometry, other_geometry, other)
+        table = fusion.prediction_error_table(base, other, async_cache.scenario_ids(other_geometry), horizons)
+        odometry.ACTIVE = odometry.OdometryTable.for_records(args.odometry, args.geometry_cache, records)
+    else:
+        odometry.ACTIVE = odometry.OdometryTable.for_records(args.odometry, args.geometry_cache, records)
+        table = fusion.prediction_error_table(base, records, scenarios, horizons,
+                                              causal=args.staleness_table == "causal")
     _W.update(
         records=records, scenarios=scenarios, async_dir=args.async_dir, taus=args.taus,
-        table=fusion.prediction_error_table(base, records, scenarios, range(max(args.taus) + 1)),
+        table=table,
         model=base.load_alignformer_pva(args.checkpoint, torch.device("cpu"))[0],
         freealign=base.freealign_config_from_calibration(args.freealign_calibration),
         robust=base.RobustSolveConfig(mode="huber", iterations=2),
         nms=float(base.load_yaml(str(args.opencood_config), None)["postprocess"]["nms_thresh"]),
     )
-    if args.odometry is not None:
-        from embedding_aware_belt_fusion.alignformer_ext import odometry
-
-        odometry.ACTIVE = odometry.OdometryTable.for_records(args.odometry, args.geometry_cache, records)
     results = {}
     with cf.ProcessPoolExecutor(max_workers=args.workers, mp_context=mp.get_context("fork")) as pool:
         futures = [pool.submit(run, c) for c in conditions]
@@ -138,7 +173,8 @@ def main() -> None:
             for k in ("exact", "within_1", "mae_ms"):
                 summary[key][sigma].setdefault("latency", {})[k] = float(np.mean([e["latency"][k] for e in per_seed]))
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps({"summary": summary, "per_seed": results}, indent=1))
+    args.output.write_text(json.dumps({"staleness_table": args.staleness_table, "staleness_from": [str(p) for p in args.staleness_from or []],
+                                       "summary": summary, "per_seed": results}, indent=1))
     print(f"Wrote {args.output}")
     for key in sorted(summary, key=lambda k: int(k[1:])):
         print(f"\n{key} ({int(key[1:]) * 100} ms): AP@0.7, all frames")

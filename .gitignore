@@ -253,3 +253,10 @@ __marimo__/
 *.toc
 *.synctex.gz
 docs/**/*.out
+
+# Local-only folders and files (not versioned)
+/AlignFormer-2027/
+/.vscode/
+/Writing_skills.md
+/cloud/
+/runs/

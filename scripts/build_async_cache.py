@@ -61,6 +61,8 @@ def main() -> None:
     parser.add_argument("--compensate", action="store_true", help="also build the velocity-compensated conditions")
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/async_opv2v"))
     parser.add_argument("--workers", type=int, default=20)
+    parser.add_argument("--odometry", type=Path, required=True,
+                        help="each sender's own odometry (scripts/build_odometry_table.py), for its velocity tracking")
     args = parser.parse_args()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -77,6 +79,9 @@ def main() -> None:
     scenarios = async_cache.scenario_ids(args.geometry_cache)
     if len(scenarios) != len(records):
         raise ValueError(f"{args.geometry_cache}: {len(scenarios)} frames, frame table has {len(records)}")
+    from embedding_aware_belt_fusion.alignformer_ext import odometry
+
+    odometry.ACTIVE = odometry.OdometryTable.for_records(args.odometry, args.geometry_cache, records)
     _W.update(
         records=records, scenarios=scenarios,
         velocities=async_cache.cav_velocities(base, records, scenarios),

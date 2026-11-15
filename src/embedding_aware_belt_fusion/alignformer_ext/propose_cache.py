@@ -24,13 +24,16 @@ from embedding_aware_belt_fusion.alignformer_pva.inference import build_pairwise
 from embedding_aware_belt_fusion.freealign.inference import correct_simple_detections as freealign_correct
 
 
-def noisy_cav_boxes(base, record, frame_index: int, sigma: float, seed: int) -> Dict[str, torch.Tensor]:
-    """``run_condition``'s noisy ego-frame CAV boxes for one frame, keyed by CAV id."""
+def noisy_cav_boxes(base, record, frame_index: int, sigma: float, seed: int, noise=None) -> Dict[str, torch.Tensor]:
+    """``run_condition``'s noisy ego-frame CAV boxes for one frame, keyed by CAV id. ``noise`` (a
+    ``noise_kinds.PoseNoise``) replaces the benchmark draw with another noise kind (T5); None = the benchmark."""
     out = {}
     for agent_index, cav_id in enumerate(sorted(record.cav_boxes)):
         if cav_id not in record.cav_poses:
             continue
-        if sigma == 0.0:
+        if noise is not None:
+            pose = noise.perturb(record.cav_poses[cav_id], frame_index, cav_id, base.POSE_X, base.POSE_Y, base.POSE_YAW)
+        elif sigma == 0.0:
             pose = record.cav_poses[cav_id]
         else:
             rng = base.sweep_rng(seed, sigma, frame_index, agent_index)
@@ -41,7 +44,7 @@ def noisy_cav_boxes(base, record, frame_index: int, sigma: float, seed: int) -> 
 
 
 def build_condition(base, records: List, model, robust_config, sigma: float, seed: int,
-                    freealign_config=None) -> Dict[str, np.ndarray]:
+                    freealign_config=None, noise=None) -> Dict[str, np.ndarray]:
     """Propose over every (frame, CAV) pair of one condition, as flat arrays with offsets."""
     frame, cav_rank, attempted, freealign_boxes = [], [], [], []
     cav_boxes, cav_count = [], []
@@ -49,7 +52,7 @@ def build_condition(base, records: List, model, robust_config, sigma: float, see
     plans, plan_shape = [], []
     with torch.no_grad():
         for frame_index, record in enumerate(records):
-            noisy = noisy_cav_boxes(base, record, frame_index, sigma, seed)
+            noisy = noisy_cav_boxes(base, record, frame_index, sigma, seed, noise)
             for rank, cav_id in enumerate(sorted(record.cav_boxes)):
                 if cav_id not in noisy:
                     continue
@@ -84,6 +87,7 @@ def build_condition(base, records: List, model, robust_config, sigma: float, see
                 plan_shape.append(plan.shape)
     out = {
         "sigma": np.float64(sigma), "seed": np.int64(seed),
+        "noise_kind": np.str_(noise.kind if noise is not None else "benchmark"),
         "frame": np.asarray(frame, np.int64), "cav_rank": np.asarray(cav_rank, np.int64),
         "attempted": np.asarray(attempted, bool),
         "cav_boxes": np.concatenate(cav_boxes) if cav_boxes else np.zeros((0, 7), np.float32),
@@ -102,13 +106,30 @@ def condition_path(cache_dir: Path, sigma: float, seed: int) -> Path:
     return Path(cache_dir) / f"sigma_{sigma:g}_seed_{seed}.npz"
 
 
-def noisy_poses(base, record, frame_index: int, sigma: float, seed: int) -> Dict[str, list]:
-    """The same per-CAV noisy world poses ``noisy_cav_boxes`` projects with (identical draws)."""
+def noise_of(cache: Dict[str, np.ndarray]):
+    """The ``noise_kinds.PoseNoise`` a cache was built with, or None for the benchmark draws. Its frame keys come from
+    the active odometry table (the sweep's --odometry), which every non-benchmark cache needs."""
+    kind = str(cache["noise_kind"]) if "noise_kind" in cache else "benchmark"
+    if kind == "benchmark":
+        return None
+    from embedding_aware_belt_fusion.alignformer_ext import noise_kinds, odometry
+
+    table = odometry.active()
+    if table is None:
+        raise RuntimeError(f"a '{kind}' cache needs the odometry table's frame keys (pass --odometry)")
+    return noise_kinds.PoseNoise(kind, float(cache["sigma"]), int(cache["seed"]), table.frames)
+
+
+def noisy_poses(base, record, frame_index: int, sigma: float, seed: int, noise=None) -> Dict[str, list]:
+    """The same per-CAV noisy world poses ``noisy_cav_boxes`` projects with (identical draws; ``noise`` as there)."""
     out = {}
     for agent_index, cav_id in enumerate(sorted(record.cav_boxes)):
         if cav_id not in record.cav_poses:
             continue
-        if sigma == 0.0:
+        if noise is not None:
+            out[cav_id] = noise.perturb(record.cav_poses[cav_id], frame_index, cav_id, base.POSE_X, base.POSE_Y,
+                                        base.POSE_YAW)
+        elif sigma == 0.0:
             out[cav_id] = list(record.cav_poses[cav_id])
         else:
             rng = base.sweep_rng(seed, sigma, frame_index, agent_index)

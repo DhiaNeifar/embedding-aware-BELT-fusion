@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""LiDAR odometry for every agent of a dataset split: KISS-ICP on the agent's own scans, nothing else.
+"""Odometry for every agent of a dataset split, in one table format for the temporal layer.
 
-Each agent's trajectory is estimated from its scans alone, starting at identity at its first scan. No recorded pose
-is read, so the plug-in's odometry carries no ground truth and no simulated noise. Runs in its own environment,
-because this needs only numpy and kiss-icp:
+``--source kiss-icp`` (V2X-Real): KISS-ICP on the agent's own scans, starting at identity at its first scan; no
+recorded pose is read. ``--source recorded`` (OPV2V): the simulator's recorded LiDAR poses, i.e. exact relative
+motion, as the dataset provides it. Either way only relative motion between an agent's own frames is used, never the
+noise. Runs in its own environment, because this needs only numpy and kiss-icp:
 
-    outputs/kiss_icp_env/bin/python scripts/build_odometry_table.py \\
-        --split-dir /mnt/external/workspace/public/dataset/opv2v/test --output outputs/odometry/opv2v_test.npz
+    outputs/kiss_icp_env/bin/python scripts/build_odometry_table.py --source kiss-icp \\
+        --split-dir /mnt/external/workspace/public/dataset/v2x-real/test --output outputs/odometry/v2xreal_test.npz
 """
 
 from __future__ import annotations
@@ -43,6 +44,33 @@ def agent_scans(agent_dir: Path) -> List[Path]:
     return sorted(scans, key=lambda p: p.stem)
 
 
+def recorded_pose(yaml_path: Path) -> np.ndarray:
+    """4x4 LiDAR pose from an OPV2V frame yaml (``lidar_pose``: x, y, z, roll, yaw, pitch in degrees), the same
+    convention as opencood.utils.transformation_utils.x_to_world."""
+    import re
+
+    # the yaml carries python-specific tags elsewhere, so read the one block we need directly
+    block = re.search(r"^lidar_pose:\s*\n((?:\s*-\s*\S+\s*\n){6})", open(yaml_path).read(), re.M)
+    x, y, z, roll, yaw, pitch = (float(v) for v in re.findall(r"-\s*(\S+)", block.group(1)))
+    cy, sy = np.cos(np.radians(yaw)), np.sin(np.radians(yaw))
+    cr, sr = np.cos(np.radians(roll)), np.sin(np.radians(roll))
+    cp, sp = np.cos(np.radians(pitch)), np.sin(np.radians(pitch))
+    m = np.eye(4)
+    m[:3, 3] = [x, y, z]
+    m[0, 0], m[0, 1], m[0, 2] = cp * cy, cy * sp * sr - sy * cr, -cy * sp * cr - sy * sr
+    m[1, 0], m[1, 1], m[1, 2] = sy * cp, sy * sp * sr + cy * cr, -sy * sp * cr + cy * sr
+    m[2, 0], m[2, 1], m[2, 2] = sp, -cp * sr, cp * cr
+    return m
+
+
+def run_recorded(job: Tuple[str, str, str, float, int]):
+    agent_dir, scenario, agent, _, limit = job
+    scans = agent_scans(Path(agent_dir))
+    if limit:
+        scans = scans[:limit]
+    return scenario, agent, [p.stem for p in scans], np.stack([recorded_pose(p.with_suffix(".yaml")) for p in scans])
+
+
 def run_agent(job: Tuple[str, str, str, float, int]):
     """(scenario, agent, frame ids, (F, 4, 4) poses of the agent in its own first-scan frame)."""
     from kiss_icp.config import load_config
@@ -68,6 +96,7 @@ def run_agent(job: Tuple[str, str, str, float, int]):
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--source", choices=["kiss-icp", "recorded"], required=True)
     parser.add_argument("--split-dir", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--max-range", type=float, default=100.0)
@@ -85,7 +114,8 @@ def main() -> None:
 
     rows, frames, poses = [], [], []
     with ProcessPoolExecutor(max_workers=args.workers) as pool:
-        futures = [pool.submit(run_agent, job) for job in jobs]
+        worker = run_agent if args.source == "kiss-icp" else run_recorded
+        futures = [pool.submit(worker, job) for job in jobs]
         for future in tqdm(as_completed(futures), total=len(futures), desc=f"odometry {args.split_dir.name}"):
             scenario, agent, ids, trajectory = future.result()
             rows += [(scenario, agent)] * len(ids)
@@ -95,7 +125,7 @@ def main() -> None:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(args.output, scenario=np.array([r[0] for r in rows]), agent=np.array([r[1] for r in rows]),
                         frame=np.array(frames), pose=np.concatenate(poses).astype(np.float64),
-                        max_range=np.float64(args.max_range))
+                        max_range=np.float64(args.max_range), source=np.array(args.source))
     print(f"{len(frames)} scans, {len(jobs)} agent trajectories -> {args.output}")
 
 

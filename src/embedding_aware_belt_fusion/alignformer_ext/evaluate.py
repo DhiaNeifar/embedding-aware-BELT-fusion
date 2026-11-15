@@ -36,16 +36,20 @@ def apply_correction(boxes: torch.Tensor, psi: float, tx: float, ty: float) -> t
 
 def score_condition(base, records, cache: Dict[str, np.ndarray], decided: Optional[np.ndarray],
                     nms_thresh: float, oracle: bool = False, freealign: bool = False,
-                    score_scale: Optional[np.ndarray] = None) -> Dict[str, Dict]:
+                    score_scale: Optional[np.ndarray] = None, frames=None, per_frame=None) -> Dict[str, Dict]:
     """Per-bucket TP/FP stats. ``decided`` (P, 3) psi, tx, ty per cached pair (zero = keep the noisy boxes);
     ``None`` scores the uncorrected boxes; ``oracle=True`` the true-pose boxes; ``freealign=True`` the cached
-    FreeAlign-corrected boxes. ``score_scale`` (flat, one per cached CAV box) multiplies the CAV boxes' scores."""
+    FreeAlign-corrected boxes. ``score_scale`` (flat, one per cached CAV box) multiplies the CAV boxes' scores.
+    ``frames`` (a set of frame indices) scores only those frames (audit E2 bins); None scores every frame.
+    ``per_frame`` (a dict) also receives each frame's own stats, frame index -> stats (audit E0 bootstrap)."""
     stats = {bucket: base.new_stats() for bucket in BUCKETS}
     pairs_by_frame: Dict[int, list] = {}
     for p, frame in enumerate(cache["frame"]):
         pairs_by_frame.setdefault(int(frame), []).append(p)
     cav_off = cache["cav_off"]
     for frame_index, record in enumerate(records):
+        if frames is not None and frame_index not in frames:
+            continue
         boxes = [record.ego_boxes]
         scores = [record.ego_scores]
         cav_ids = sorted(record.cav_boxes)
@@ -78,6 +82,9 @@ def score_condition(base, records, cache: Dict[str, np.ndarray], decided: Option
         bucket = "ge3" if cav_count(record) >= 3 else "lt3"
         for name in ("all", bucket) + (("multi",) if cav_count(record) >= 2 else ()):
             base.fuse_and_score_accumulate(corners, scores_np, record.gt_corners, nms_thresh, stats[name])
+        if per_frame is not None:
+            per_frame[frame_index] = base.new_stats()
+            base.fuse_and_score_accumulate(corners, scores_np, record.gt_corners, nms_thresh, per_frame[frame_index])
     return stats
 
 
