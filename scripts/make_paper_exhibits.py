@@ -79,7 +79,7 @@ STYLE = {
     "freealign": ("FreeAlign", "#eb6834", "-"),
     "coalign": ("CoAlign", "#1baf7a", "-"),
     "roco": ("RoCo", "#eda100", "-"),
-    "alignformer": ("AlignFormer", "#2a78d6", "-"),
+    "alignformer": ("RobustAlign", "#2a78d6", "-"),
 }
 
 
@@ -232,7 +232,7 @@ def table_t6() -> str:
 
 
 # --------------------------------------------------------------------------------------- supplement: pooled baselines
-CORE = r"\core"   # macro for the per-frame estimator (Propose, Refine, Abstain), defined in preamble.tex
+CORE = r"\core"   # macro for the per-frame estimator (Propose, Refine, Validate), defined in preamble.tex
 POOLED_ROWS = [("freealign", "freealign_tk", "FreeAlign"), ("coalign_frame", "coalign_tk", "CoAlign"),
                ("roco_frame", "roco_tk", "RoCo"), ("alignformer_c", "alignformer_tk", CORE)]
 
@@ -328,8 +328,8 @@ def table_decision() -> tuple:
             e5.update(json.loads(path.read_text()))
     harm = lambda rule, s: e5.get(s, {}).get("rules", {}).get(rule, {}).get("all", {}).get("harmful")
     bottom = _bold_rows([(label, [harm(rule, s) for s in STD_SIGMAS]) for rule, label in
-                         (("none", "No Abstain"), ("agreement", "Agreement only"), ("wald_only", "$W$ only"),
-                          ("full", "Full one-frame Abstain"), ("pooled", r"\paper, pooled"))], lower=True)
+                         (("none", "No Validate"), ("agreement", "Agreement only"), ("wald_only", "$W$ only"),
+                          ("full", "Full one-frame Validate"), ("pooled", r"\paper, pooled"))], lower=True)
     return "\n".join(top) + "\n", "\n".join(bottom) + "\n"
 
 
@@ -399,8 +399,8 @@ def figure_f5(plt) -> None:
     fig, axes = plt.subplots(1, 2, figsize=(3.4, 1.55))
     x = [0, 100, 200, 400]
     lines = [("bare", RAW, "#9a9ca1", "-"), ("freealign", "FreeAlign", "#eb6834", "-"),
-             ("ignored", "AlignFormer, delay ignored", "#86b6ef", "-"),
-             ("latency_scores", "AlignFormer", "#2a78d6", "-")]
+             ("ignored", "RobustAlign, delay ignored", "#86b6ef", "-"),
+             ("latency_scores", "RobustAlign", "#2a78d6", "-")]
     for ax, dataset in zip(axes, NETWORKS):
         data = delay_data(dataset)
         for key, label, color, dash in lines:
@@ -453,7 +453,7 @@ def pose_data(dataset: str):
 
 def table_t4() -> str:
     order = [("bare", RAW), ("freealign", "FreeAlign"), ("coalign", "CoAlign"), ("roco", "RoCo"),
-             ("alignformer", r"\textbf{AlignFormer}")]
+             ("alignformer", r"\textbf{\paper}")]
     lines = []
     for dataset in NETWORKS:
         data = pose_data(dataset)
@@ -507,8 +507,8 @@ def figure_f7(plt) -> None:
 def table_t7() -> str:
     """Rows: one stage added at a time. Columns: sigma 0 / 1 / 2 per dataset (AP@0.7). sigma 1 from
     ablation_<ds>.json, sigma 0 and 2 from ablation_<ds>_s0s2.json; the delay stages at 200 ms from T6 (sigma 1)."""
-    stages = [("propose_only", "Propose"), ("propose_verify", "+ Refine"), ("alignformer_c", "+ Abstain"),
-              ("alignformer_pool", "+ pooling"), ("alignformer_tk", r"+ window Abstain")]
+    stages = [("propose_only", "Propose"), ("propose_verify", "+ Refine"), ("alignformer_c", "+ Validate"),
+              ("alignformer_pool", "+ pooling"), ("alignformer_tk", r"+ window Validate")]
     delay = [("ignored", r"\paper, delay ignored"), ("latency", "+ delay estimate"),
              ("latency_scores", "+ staleness scores")]
     sigmas = STD_SIGMAS
@@ -547,8 +547,8 @@ def table_cost() -> str:
             for ds in NETWORKS}
     lines = []
     rows = [("Propose", lambda c: c["ms_per_frame"]["propose"]),
-            ("Refine + Abstain", lambda c: c["ms_per_frame"]["verify_abstain"]),
-            ("Pooling + window Abstain", lambda c: c["ms_per_frame"]["pooling"]),
+            ("Refine + Validate", lambda c: c["ms_per_frame"]["verify_abstain"]),
+            ("Pooling + window Validate", lambda c: c["ms_per_frame"]["pooling"]),
             (r"\paper, total", lambda c: c["ms_per_frame"]["propose"] + c["ms_per_frame"]["full_method"]),
             ("FreeAlign, reference", lambda c: c["ms_per_frame"]["freealign"])]
     for label, get in rows:
@@ -604,7 +604,7 @@ def figure_f8(plt) -> None:
     x = np.arange(len(names))
     width = 0.26
     colors = {"bare": (RAW, "#9a9ca1"), "freealign": ("FreeAlign", "#eb6834"),
-              "alignformer_tk": ("AlignFormer", "#2a78d6")}
+              "alignformer_tk": ("RobustAlign", "#2a78d6")}
     for ax, ds in zip(axes, NETWORKS):
         for i, (m, _) in enumerate(NOISE_METHODS):
             label, color = colors[m]
