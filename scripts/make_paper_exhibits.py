@@ -208,16 +208,33 @@ def delay_data(dataset: str) -> dict:
             row["latency_mae"] = float(np.mean([e["latency"]["mae_ms"] for e in data["per_seed"][d][sigma]]))
             row["n"] = len(data["per_seed"][d][sigma])
             rows[(d, sigma)] = row
+    # CoAlign and RoCo on the same delayed pairs (scripts/delay_pgo.py), when that run is on disk
+    pgo = OUT / f"delay_{dataset}_pgo.json"
+    if pgo.exists():
+        extra = json.loads(pgo.read_text())["summary"]
+        for (d, sigma), row in rows.items():
+            for method in ("coalign", "roco"):
+                entry = extra.get(d, {}).get(sigma, {}).get("all", {}).get(method)
+                if entry is not None and entry["ap_70"]["n"] == row["n"]:     # the same draws as the other rows
+                    row[method] = entry["ap_70"]["mean"]
     return rows
 
 
 def table_t6() -> str:
-    order = [("bare", RAW), ("freealign", "FreeAlign"), ("ignored", r"\paper, delay ignored"),
+    order = [("bare", RAW), ("freealign", "FreeAlign"), ("coalign", "CoAlign"), ("roco", "RoCo"),
+             ("ignored", r"\paper, delay ignored"),
              ("latency", r"+ delay estimate"), ("latency_scores", r"\textbf{+ staleness scores}")]
-    compared = ["freealign", "ignored", "latency", "latency_scores"]
     data = {ds: delay_data(ds) for ds in NETWORKS}
     cols = [(ds, sigma, d) for ds in NETWORKS for sigma in ("0", "1") for d in DELAYS]
-    text = {c: bold_best({k: data[c[0]][(c[2], c[1])][k] for k in [m for m, _ in order]}, compared) for c in cols}
+
+    def column(c):   # CoAlign / RoCo pending until scripts/delay_pgo.py has run; bold only among what is there
+        row = data[c[0]][(c[2], c[1])]
+        present = [m for m, _ in order if m in row]
+        compared = [m for m in ("freealign", "coalign", "roco", "ignored", "latency", "latency_scores") if m in row]
+        text = bold_best({k: row[k] for k in present}, compared)
+        return {m: text.get(m, PEND) for m, _ in order}
+
+    text = {c: column(c) for c in cols}
     lines = []
     for key, label in order:
         lines.append(f"{label} & " + " & ".join(text[c][key] for c in cols) + r" \\")

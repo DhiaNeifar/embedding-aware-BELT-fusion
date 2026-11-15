@@ -140,7 +140,7 @@ def frame_panels() -> dict:
         """Blend a translucent fill of the boxes' BEV footprints into the canvas."""
         import cv2
         xy, _ = canvas.get_canvas_coords(boxes[:, :4, :2].reshape(-1, 2))
-        polygons = xy.reshape(-1, 4, 2)[:, :, ::-1].astype(np.int32)   # canvas coords are (row, col); cv2 wants (x, y)
+        polygons = xy.reshape(-1, 4, 2).astype(np.int32)   # Canvas_BEV_heading_right already returns (x=col, y=row), as cv2 wants
         overlay = canvas.canvas.copy()
         cv2.fillPoly(overlay, list(polygons), colour)
         canvas.canvas = cv2.addWeighted(overlay, alpha, canvas.canvas, 1 - alpha, 0)
@@ -158,9 +158,9 @@ def frame_panels() -> dict:
         # Ground truth UNDER the estimates: a translucent fill and a wide band. A correct box then shows as a thin
         # coloured line running inside the green band, so it stays visible instead of being painted over.
         fill_boxes(canvas, gt, rgb(HEX["gt"]), alpha=0.25)
-        canvas.draw_boxes(gt, colors=rgb(HEX["gt"]), box_line_thickness=5)
+        canvas.draw_boxes(gt, colors=rgb(HEX["gt"]), box_line_thickness=2)
         canvas.draw_boxes(raw_boxes, colors=rgb(HEX["bare"]), box_line_thickness=2)
-        canvas.draw_boxes(corners(t), colors=rgb(HEX[m]), box_line_thickness=2)
+        canvas.draw_boxes(corners(t), colors=rgb(HEX[m]), box_line_thickness=3)   # on top, wider than the GT line
         images[m] = canvas.get_canvas().copy()
     meta = {"scenario": scenario, "frame_id": frame_id, "ego_id": ego_id, "cav_id": key[1],
             "rule": "all vehicles in view detected by the CAV, every baseline moves the boxes >= 0.5 m from raw, "
@@ -180,13 +180,15 @@ SIGMAS = [0.0, 0.5, 1.0, 1.5, 2.0]
 MARKERS = {"bare": "x", "freealign": "s", "coalign": "^", "roco": "D", "alignformer": "o"}
 
 
-def table_rows(name: str):
+def table_rows(name: str, skip_pending: bool = False):
     rows = []
     dataset = "opv2v"
     for line in (mpe.TABLES / name).read_text().splitlines():
         if r"\multicolumn" in line and "V2X-Real" in line:
             dataset = "v2xreal"
         if " & " not in line:
+            continue
+        if skip_pending and r"\pending" in line:      # a row whose run is not on disk yet: left out of the figure
             continue
         label, *cells = line.split(" & ")
         values = []
@@ -226,12 +228,15 @@ def curves_from_tables():
 
 
 def delay_from_tables():
-    rows = {label: values for _, label, values in table_rows("t6_delay_body.tex")}
+    rows = {label: values for _, label, values in table_rows("t6_delay_body.tex", skip_pending=True)}
     delay = {}
     for ds, offset in [("opv2v", 0), ("v2xreal", 8)]:
         delay[ds] = {"bare": rows["Raw pose"][offset:offset + 4],
                      "freealign": rows["FreeAlign"][offset:offset + 4],
                      "alignformer": rows[r"\textbf{+ staleness scores}"][offset:offset + 4]}
+        for label, method in (("CoAlign", "coalign"), ("RoCo", "roco")):   # scripts/delay_pgo.py, once it has run
+            if label in rows:
+                delay[ds][method] = rows[label][offset:offset + 4]
     return delay
 
 
@@ -262,6 +267,33 @@ def reuse_lidar_images(source: Path):
     def chunk(kind, data):
         return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xffffffff)
 
+    def literal_string(data: bytes, start: int) -> bytes:
+        """The PDF literal string opening at data[start] == '(' (balanced parentheses, backslash escapes)."""
+        escapes = {b"n": b"\n", b"r": b"\r", b"t": b"\t", b"b": b"\b", b"f": b"\f"}
+        out, depth, i = bytearray(), 0, start
+        while True:
+            c = data[i:i + 1]
+            if c == b"\\":
+                nxt = data[i + 1:i + 2]
+                octal = re.match(rb"[0-7]{1,3}", data[i + 1:i + 4])
+                if octal:
+                    out += bytes([int(octal[0], 8) & 0xFF]); i += 1 + len(octal[0]); continue
+                if nxt in (b"\r", b"\n"):         # line continuation
+                    i += 2 + (nxt == b"\r" and data[i + 2:i + 3] == b"\n"); continue
+                out += escapes.get(nxt, nxt); i += 2; continue
+            if c == b"(":
+                depth += 1
+                if depth > 1:
+                    out += c
+            elif c == b")":
+                depth -= 1
+                if depth == 0:
+                    return bytes(out)
+                out += c
+            else:
+                out += c
+            i += 1
+
     pattern = rb"\d+ 0 obj\s*<<[^>]*?/Subtype /Image.*?stream\r?\n"
     for match in re.finditer(pattern, pdf, re.S):
         info = match.group()
@@ -272,20 +304,53 @@ def reuse_lidar_images(source: Path):
         length_ref = int(re.search(rb"/Length (\d+) 0 R", info)[1])
         length = int(re.search(rb"(?m)^" + str(length_ref).encode() + rb" 0 obj\s*(\d+)", pdf)[1])
         compressed = pdf[match.end():match.end() + length]
-        png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+        indexed = re.search(rb"/ColorSpace\s*\[\s*/Indexed\s*/DeviceRGB\s+(\d+)\s*\(", info)
+        if indexed:
+            # Matplotlib stores an image with few colours as a palette image: /Indexed /DeviceRGB <hival> (palette),
+            # /BitsPerComponent 1, 2, 4 or 8. Rewrapped as a PNG palette image (colour type 3, PLTE chunk), it decodes
+            # to the same RGB pixels.
+            palette = literal_string(pdf, match.start() + indexed.end() - 1)
+            entries = int(indexed[1]) + 1
+            if len(palette) != 3 * entries:
+                raise ValueError(f"Palette of {len(palette)} bytes for {entries} colours")
+            bits = int(re.search(rb"/BitsPerComponent (\d+)", info)[1])
+            png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, bits, 3, 0, 0, 0))
+            png += chunk(b"PLTE", palette)
+        else:
+            png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
         png += chunk(b"IDAT", compressed) + chunk(b"IEND", b"")
         object_id = re.match(rb"(\d+) 0 obj", info)[1]
         resource = re.search(rb"/(I\d+) " + object_id + rb" 0 R", pdf)
         if resource is None or resource[1] not in image_heights:
             raise ValueError("Cannot establish the native LiDAR image orientation")
         with Image.open(io.BytesIO(png)) as image:
-            pixels = np.array(image)
+            pixels = np.array(image.convert("RGB"))
             if image_heights[resource[1]] < 0:
                 pixels = pixels[::-1].copy()
             images.append(pixels)
     if len(images) != 4:
         raise ValueError(f"Expected four LiDAR views, found {len(images)}")
     return {"images": dict(zip(METHODS, images)), "meta": {"reused_from": str(source)}}
+
+
+def _pdf_palette_bit_depth_fix():
+    """Matplotlib < 3.7 writes a palette image (few colours: /Indexed, /BitsPerComponent 1, 2 or 4) without the bit
+    depth in its /DecodeParms. The PNG predictor then defaults to 8 bits, and strict PDF readers (Ghostscript,
+    pdf.js) decode the LiDAR views as white. Newer Matplotlib writes the field; this adds it, nothing else."""
+    from matplotlib.backends import backend_pdf
+
+    if getattr(backend_pdf.PdfFile, "_palette_bit_depth_fixed", False):
+        return
+    original = backend_pdf.PdfFile.beginStream
+
+    def begin_stream(self, id, len, extra=None, png=None):
+        bits = (extra or {}).get("BitsPerComponent", 8)
+        if png is not None and bits != 8 and "BitsPerComponent" not in png:
+            png = dict(png, BitsPerComponent=bits)
+        return original(self, id, len, extra, png)
+
+    backend_pdf.PdfFile.beginStream = begin_stream
+    backend_pdf.PdfFile._palette_bit_depth_fixed = True
 
 
 def render_figure(frame, late, hosts, delay, output: Path, preview: Path | None):
@@ -295,7 +360,7 @@ def render_figure(frame, late, hosts, delay, output: Path, preview: Path | None)
     from matplotlib.lines import Line2D
     from matplotlib.patches import Patch
 
-    plt.rcParams.update({"font.family": "serif", "font.serif": ["Times New Roman", "Times", "DejaVu Serif"],
+    plt.rcParams.update({"font.family": "serif", "font.serif": ["Times New Roman", "Times", "Liberation Serif", "DejaVu Serif"],
                          "mathtext.fontset": "stix", "pdf.fonttype": 42, "font.size": 7,
                          "axes.linewidth": 0.6, "xtick.major.width": 0.5, "ytick.major.width": 0.5})
     # CVPR \textwidth is 6.875 in; the figure is drawn at that width so fonts print at their nominal size.
@@ -367,7 +432,7 @@ def render_figure(frame, late, hosts, delay, output: Path, preview: Path | None)
                 ax.axhline(ego, color=HEX["ego"], lw=.85, ls=(0, (1, 1.2)), zorder=1)
             reference = hosts[ds]["perfect"][0] if col == 1 else late[ds]["perfect"][0]
             ax.axhline(reference, color=HEX["perfect"], lw=.85, ls=(0, (4, 2)), zorder=1)
-            methods = ["bare", "freealign", "alignformer"] if col == 2 else ["bare", *METHODS]
+            methods = ["bare", *METHODS] if col != 2 else [m for m in ["bare", *METHODS] if m in values]
             for method in methods:
                 ax.plot(x, values[method], color=HEX[method], marker=MARKERS[method], ms=2.6,
                         lw=1.5 if method == "alignformer" else 1.0,
@@ -392,6 +457,7 @@ def render_figure(frame, late, hosts, delay, output: Path, preview: Path | None)
                     ax.set_xlabel(r"Pose noise $\sigma$ (m and $^\circ$)", labelpad=1.5, fontsize=7)
             if row == 0:
                 ax.tick_params(labelbottom=False)
+    _pdf_palette_bit_depth_fix()
     fig.savefig(output, dpi=300, pad_inches=0, metadata={
         "Title": "RobustAlign: pose and delay robustness",
         "Subject": "Native LiDAR views and AP0.7 from generated late-fusion, V2VAM and delay tables; delay sigma=0",
