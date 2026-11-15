@@ -16,7 +16,3 @@
 [submodule "external/QuantV2X"]
 	path = external/QuantV2X
 	url = https://github.com/ucla-mobility/QuantV2X.git
-[submodule "external/jigsawcomm-v2x"]
-	path = external/jigsawcomm-v2x
-	url = https://github.com/ch3ny1/jigsawcomm-v2x.git
-	branch = baselines-package
